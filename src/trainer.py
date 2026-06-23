@@ -49,5 +49,9 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == '__main__': 
-    args = parse_args()
-    print(args.aft)
+    dataset = load_wavs(include_demographics=True)
+    train_data, test_data = cross_validation(dataset)
+    train_loader = batch_inputs(train_data, oversample=True)
+    test_data = batch_inputs(test_data)
+
+    print(train_loader)

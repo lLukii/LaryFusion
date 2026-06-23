@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import RandomOverSampler
 from transformers import Wav2Vec2FeatureExtractor
 
 config = Config()
@@ -58,9 +59,13 @@ def cross_validation(dataset):
 
     return train_data, test_data
 
-def batch_inputs(data): 
+def batch_inputs(data, oversample=False): 
     batches, batch_labels = [], []
     labels = torch.tensor([patient["label"] for patient in data]).reshape(-1, 1)
+    if oversample: 
+        ros = RandomOverSampler(random_state=config.seed)
+        data, labels = ros.fit_resample(torch.tensor(data).reshape(-1, 1), labels)
+
     for idx in range(0, len(data), config.batch_size):
         if idx + config.batch_size <= len(data):
             batch = data[idx:idx+config.batch_size]
@@ -72,5 +77,5 @@ def batch_inputs(data):
         batches.append(batch)
         batch_labels.append(batch_label)
     
-    return torch.tensor(batches), torch.tensor(batch_labels)
+    return batches, batch_labels
 
