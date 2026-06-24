@@ -16,7 +16,7 @@ def load_wavs(include_demographics=False):
     patients = {}
     for voice_type in ["benign", "malignant", "normal"]:
         for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
-            if sample.split(".")[1] != "wav":
+            if sample.split(".")[-1] != "wav":
                 continue
             user_id = sample.split(".")[0]
             signal, _ = librosa.load(os.path.join(config.dataset_path, voice_type, sample),
@@ -53,14 +53,12 @@ def load_wavs(include_demographics=False):
     return patients
 
 def cross_validation(dataset): 
-    patient_list = [patient for patient in dataset]
+    patient_list = list(dataset.values())
     train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
-    train_data, test_data = torch.tensor(train_data), torch.tensor(test_data)
-
     return train_data, test_data
 
-def batch_inputs(data, oversample=False): 
-    batches, batch_labels = [], []
+def batch_inputs(data, oversample=False):
+    batches = []
     labels = torch.tensor([patient["label"] for patient in data]).reshape(-1, 1)
     if oversample: 
         ros = RandomOverSampler(random_state=config.seed)
@@ -73,9 +71,7 @@ def batch_inputs(data, oversample=False):
         else:
             batch = data[idx:]
             batch_label = labels[idx:]
-
-        batches.append(batch)
-        batch_labels.append(batch_label)
+        
+        batches.append((batch, batch_label))
     
-    return batches, batch_labels
-
+    return batches
