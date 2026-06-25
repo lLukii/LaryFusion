@@ -58,20 +58,33 @@ def cross_validation(dataset):
     return train_data, test_data
 
 def batch_inputs(data, oversample=False):
-    batches = []
-    labels = torch.tensor([patient["label"] for patient in data]).reshape(-1, 1)
-    if oversample: 
+    labels = torch.tensor([patient["label"] for patient in data])
+    if oversample:
         ros = RandomOverSampler(random_state=config.seed)
-        data, labels = ros.fit_resample(torch.tensor(data).reshape(-1, 1), labels)
+        indices = [[i] for i in range(len(data))]
+        resampled_idx, resampled_labels = ros.fit_resample(indices, labels.numpy())
+        data = [data[i[0]] for i in resampled_idx]
+        labels = torch.tensor(resampled_labels)
 
+    perm = torch.randperm(len(data), generator=torch.Generator().manual_seed(config.seed))
+    data = [data[i] for i in perm]
+    labels = labels[perm]
+
+    batch_loader = []
     for idx in range(0, len(data), config.batch_size):
-        if idx + config.batch_size <= len(data):
-            batch = data[idx:idx+config.batch_size]
-            batch_label = labels[idx:idx+config.batch_size]
-        else:
-            batch = data[idx:]
-            batch_label = labels[idx:]
-        
-        batches.append((batch, batch_label))
-    
-    return batches
+        batch = data[idx:idx + config.batch_size]
+        batch_labels = labels[idx:idx + config.batch_size]
+
+        signals = torch.stack([p["signal"].squeeze(0) for p in batch])
+        masks = torch.stack([p["attention_mask"].squeeze(0) for p in batch])
+
+        demographics = None
+        if batch[0]["background"] is not None:
+            demographics = torch.stack([
+                torch.tensor(p["background"].values.astype(float), dtype=torch.float32)
+                for p in batch
+            ])
+
+        batch_loader.append((signals, masks, demographics, batch_labels))
+
+    return batch_loader

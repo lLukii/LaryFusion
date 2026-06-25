@@ -14,4 +14,8 @@ class Config:
     w2v_name: str = "facebook/wav2vec2-base-960h"
     pretrained: bool = True
     lr: float = 1e-4
+
+
+
+
     

@@ -56,4 +56,3 @@ class MultimodalFusion(nn.Module):
         scale = torch.sqrt(torch.tensor(K.shape[-1], dtype=torch.float32, device=K.device))
         attn = F.softmax(Q @ K / scale, dim=-1)  # per-feature attention [B, dH]
         return self.classifier(attn @ V)          # [B, 2]
-        
