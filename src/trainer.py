@@ -1,19 +1,21 @@
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, f1_score
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay, f1_score
+)
 from tqdm import tqdm
 from argparse import ArgumentParser
 from config import Config
 from dataset import load_wavs, batch_inputs, cross_validation
-from models import MultimodalFusion
+from models import MultimodalFusion, AFT, Wav2VecBase
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
 
 
-def train_epoch(loader, model, optimizer, loss_fn):
+def train_epoch(args, loader, model, optimizer, loss_fn):
     model.train()
     total_loss, correct, total = 0, 0, 0
     for signals, masks, demographics, labels in tqdm(loader, desc="Train", leave=False):
@@ -35,7 +37,7 @@ def train_epoch(loader, model, optimizer, loss_fn):
     return total_loss / len(loader), correct / total
 
 
-def eval_epoch(loader, model, loss_fn):
+def eval_epoch(args, loader, model, loss_fn):
     model.eval()
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels = [], []
@@ -82,15 +84,15 @@ def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_lab
     axes[2].set_title("Confusion Matrix")
 
     plt.tight_layout()
-    plt.savefig("results.png", dpi=150)
+    plt.savefig("graphs/results.png", dpi=150)
     plt.show()
 
 
 def parse_args():
     parser = ArgumentParser(description="Train multimodal throat cancer classifier")
-    parser.add_argument("--use_lora", type=bool, default=False)
-    parser.add_argument("--multimodal", type=bool, default=True)
-    parser.add_argument("--model_path", type=str, default="models")
+    parser.add_argument("--name", type=str, required=True, help="Name of your model")
+    parser.add_argument("--use_lora", type=bool, default=False, help="Whether to use Low Rank Adaption (LoRA) fine-tuning")
+    parser.add_argument("--model_type", type=int, default=0, help="Which model to use for training")
     return parser.parse_args()
 
 
@@ -99,20 +101,29 @@ if __name__ == '__main__':
 
     dataset = load_wavs(include_demographics=True)
     train_data, test_data = cross_validation(dataset)
-    train_loader = batch_inputs(train_data, oversample=True)
+    train_loader = batch_inputs(train_data, oversample=True, shuffle=True)
     test_loader = batch_inputs(test_data)
 
     dinput_dim = len(train_data[0]["background"])
-    model = MultimodalFusion(config, dinput_dim=dinput_dim).to(config.device)
+    model = None
+    if args.model_type == 0: 
+        model = MultimodalFusion(config, dinput_dim=dinput_dim).to(config.device)
+    elif args.model_type == 1: 
+        model = AFT(config).to(config.device)
+    elif args.model_type == 2: 
+        model = Wav2VecBase(config).to(config.device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     loss_fn = nn.CrossEntropyLoss()
 
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
 
+    print(f"Model layout: {model}")
+
     for epoch in range(1, config.num_epochs + 1):
-        tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
-        val_loss, val_acc, val_f1, preds, labels = eval_epoch(test_loader, model, loss_fn)
+        tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer, loss_fn)
+        val_loss, val_acc, val_f1, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
 
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
@@ -120,8 +131,9 @@ if __name__ == '__main__':
         val_accs.append(val_acc)
 
         print(f"Epoch {epoch:02d} | "
-              f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-              f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} f1: {val_f1:.3f}")
+            f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
+            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} f1: {val_f1:.3f}")
+
 
     visualize(train_losses, val_losses, train_accs, val_accs, preds, labels)
-    torch.save(model.state_dict(), "multimodal_fusion.pt")
+    torch.save(model.state_dict(), f"checkpoints/{args.name}.pt")

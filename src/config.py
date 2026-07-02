@@ -11,11 +11,6 @@ class Config:
     batch_size: int = 32
     dataset_path: str = "/Users/llukii/Desktop/School/Programming/Multimodal throat cancer/dataset"
     model_path: str = ""
-    w2v_name: str = "facebook/wav2vec2-base-960h"
+    w2v_name: str = "facebook/wav2vec2-base"
     pretrained: bool = True
     lr: float = 1e-4
-
-
-
-
-    
