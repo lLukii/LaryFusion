@@ -1,0 +1,8 @@
+pandas
+torch 
+torchaudio
+scikit-learn
+librosa
+transformers
+peft
+imblearn

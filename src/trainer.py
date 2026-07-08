@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
-    confusion_matrix, ConfusionMatrixDisplay, f1_score
+    confusion_matrix, 
+    ConfusionMatrixDisplay, 
+    f1_score
 )
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -121,6 +123,7 @@ if __name__ == '__main__':
 
     print(f"Model layout: {model}")
 
+    best_f1 = 0
     for epoch in range(1, config.num_epochs + 1):
         tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer, loss_fn)
         val_loss, val_acc, val_f1, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
@@ -134,6 +137,8 @@ if __name__ == '__main__':
             f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
             f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} f1: {val_f1:.3f}")
 
-
-    visualize(train_losses, val_losses, train_accs, val_accs, preds, labels)
-    torch.save(model.state_dict(), f"checkpoints/{args.name}.pt")
+        if val_f1 > best_f1:
+            print("Updating best model...")
+            best_f1 = val_f1
+            torch.save(model.state_dict(), f"checkpoints/{args.name}_best.pt")
+            visualize(train_losses, val_losses, train_accs, val_accs, preds, labels)
