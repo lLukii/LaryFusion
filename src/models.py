@@ -63,7 +63,7 @@ class Wav2VecBase(nn.Module):
         self.encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
         self.classifier = nn.Linear(output_dim, 2)
     
-    def forward(self, signals, masks, demographics): 
+    def forward(self, signals, masks, demographics=None): 
         encoded = self.encoder(signals, attention_mask=masks).extract_features
         encoded = torch.mean(encoded, dim=1)
         encoded = self.classifier(F.dropout(encoded, p=0.1))

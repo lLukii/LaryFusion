@@ -8,7 +8,7 @@ import torchaudio
 
 from diffwave.inference import predict
 
-DEFAULT_MODEL_PATH = "diffwave/weights.pt"
+DEFAULT_MODEL_PATH = "checkpoints/weights.pt"
 DEFAULT_SOURCE_DIR = "dataset"
 DEFAULT_OUTPUT_DIR = "synthetic"
 

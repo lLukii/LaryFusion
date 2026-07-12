@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import numpy as np
 import torch
+import re
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -15,7 +16,7 @@ feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
 
 def load_wavs(include_demographics=False): 
     patients = {}
-    for voice_type in ["benign", "malignant", "normal"]:
+    for voice_type in ["benign", "malignant", "normal", "synthetic"]:
         for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
             if sample.split(".")[-1] != "wav":
                 continue
@@ -23,7 +24,9 @@ def load_wavs(include_demographics=False):
             signal, _ = librosa.load(os.path.join(config.dataset_path, voice_type, sample), sr=config.sampling_rate)
             if len(signal) < config.padding: 
                 signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant", constant_values=0)
-
+            else: 
+                signal = signal[:config.padding]
+            
             processed = feature_extractor(signal, sampling_rate=config.sampling_rate, return_attention_mask=True, 
                 return_tensors="pt")
             signal = processed.input_values
@@ -31,7 +34,8 @@ def load_wavs(include_demographics=False):
             patients[user_id] = {
                     "signal" : signal,
                     "attention_mask" : attn_mask,
-                    "label" : 1 if voice_type == "malignant" else 0,
+                    "label" : 1 if voice_type in ["malignant", "synthetic"] else 0,
+                    "is_synthetic" : voice_type == "synthetic",
                     "background" : None
             }
     
@@ -44,6 +48,12 @@ def load_wavs(include_demographics=False):
             for _, row in medical_history.iterrows():
                 user_id = row["ID"]
                 patients[user_id]["background"] = row.drop(["ID", "Disease category"])
+        
+        # For synthetic patients, copy the background information from the original patient
+        for patient in patients.keys(): 
+            if patients[patient]["is_synthetic"]:
+                user_id = re.sub(r"_synth\d+$", "", patient)
+                patients[patient]["background"] = patients[user_id]["background"]
 
     return patients
 
@@ -55,7 +65,8 @@ def cross_validation(dataset):
     if train_data[0]["background"] is not None:
         bg_cols = train_data[0]["background"].index
         quant_cols = [col for col in bg_cols
-                      if pd.Series([p["background"][col] for p in train_data]).nunique() > 2] # only normalize non-binary rows
+                      if pd.Series([p["background"][col] for p in train_data]).nunique() > 2] 
+        # only normalize non-binary rows
 
         train_bg = pd.DataFrame([p["background"] for p in train_data])
         scaler = StandardScaler()
