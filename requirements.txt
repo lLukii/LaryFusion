@@ -1,6 +1,7 @@
 pandas
 torch 
 torchaudio
+torchcodec
 scikit-learn
 librosa
 transformers
