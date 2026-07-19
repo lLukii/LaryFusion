@@ -36,12 +36,11 @@ class ConditionalDataset(torch.utils.data.Dataset):
 
   def __getitem__(self, idx):
     audio_filename = self.filenames[idx]
-    spec_filename = f'{audio_filename}.spec.npy'
     signal, _ = torchaudio.load(audio_filename)
-    spectrogram = np.load(spec_filename)
+    label = 1 if os.path.basename(os.path.dirname(audio_filename)) == 'malignant' else 0
     return {
         'audio': signal[0],
-        'spectrogram': spectrogram.T
+        'label': label
     }
 
 
@@ -61,7 +60,7 @@ class UnconditionalDataset(torch.utils.data.Dataset):
     signal, _ = torchaudio.load(audio_filename)
     return {
         'audio': signal[0],
-        'spectrogram': None
+        'label': None
     }
 
 
@@ -70,45 +69,29 @@ class Collator:
     self.params = params
 
   def collate(self, minibatch):
-    samples_per_frame = self.params.hop_samples
     for record in minibatch:
-      if self.params.unconditional:
-          # Filter out records that aren't long enough.
-          if len(record['audio']) < self.params.audio_len:
-            del record['spectrogram']
-            del record['audio']
-            continue
+      # Filter out records that aren't long enough.
+      if len(record['audio']) < self.params.audio_len:
+        del record['audio']
+        if 'label' in record:
+          del record['label']
+        continue
 
-          start = random.randint(0, record['audio'].shape[-1] - self.params.audio_len)
-          end = start + self.params.audio_len
-          record['audio'] = record['audio'][start:end]
-          record['audio'] = np.pad(record['audio'], (0, (end - start) - len(record['audio'])), mode='constant')
-      else:
-          # Filter out records that aren't long enough.
-          if len(record['spectrogram']) < self.params.crop_mel_frames:
-            del record['spectrogram']
-            del record['audio']
-            continue
-
-          start = random.randint(0, record['spectrogram'].shape[0] - self.params.crop_mel_frames)
-          end = start + self.params.crop_mel_frames
-          record['spectrogram'] = record['spectrogram'][start:end].T
-
-          start *= samples_per_frame
-          end *= samples_per_frame
-          record['audio'] = record['audio'][start:end]
-          record['audio'] = np.pad(record['audio'], (0, (end-start) - len(record['audio'])), mode='constant')
+      start = random.randint(0, record['audio'].shape[-1] - self.params.audio_len)
+      end = start + self.params.audio_len
+      record['audio'] = record['audio'][start:end]
+      record['audio'] = np.pad(record['audio'], (0, (end - start) - len(record['audio'])), mode='constant')
 
     audio = np.stack([record['audio'] for record in minibatch if 'audio' in record])
     if self.params.unconditional:
         return {
             'audio': torch.from_numpy(audio),
-            'spectrogram': None,
+            'label': None,
         }
-    spectrogram = np.stack([record['spectrogram'] for record in minibatch if 'spectrogram' in record])
+    label = np.stack([record['label'] for record in minibatch if 'audio' in record])
     return {
         'audio': torch.from_numpy(audio),
-        'spectrogram': torch.from_numpy(spectrogram),
+        'label': torch.from_numpy(label).long(),
     }
 
   # for gtzan
@@ -133,7 +116,7 @@ class Collator:
     audio = torch.cat(ldata, dim=0)
     return {
           'audio': audio,
-          'spectrogram': None,
+          'label': None,
     }
 
 

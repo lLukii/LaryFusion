@@ -26,38 +26,43 @@ class AFT(nn.Module):
         return label_probs, disc_probs
 
 class MultimodalFusion(nn.Module):
-    def __init__(self, config, dinput_dim, dhidden_dim=128, doutput_dim=64,
-                 aoutput_dim=768, dH=128):
+    """
+    Cross-attention Multimodal Fusion Model for Audio and Demographic Data
+    """
+    def __init__(self, config, audio_dim=512, num_features=64, demo_dim=256, dH=128):
         super().__init__()
         self.demographic_enc = nn.Sequential(
-            nn.Linear(dinput_dim, dhidden_dim),
+            nn.Linear(num_features, demo_dim),
             nn.ReLU(),
-            nn.Linear(dhidden_dim, dhidden_dim),
+            nn.Linear(demo_dim, demo_dim)
             nn.ReLU(),
-            nn.Linear(dhidden_dim, doutput_dim)
+            nn.Linear(demo_dim, demo_dim)
         )
         self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
-        self.WQ = nn.Linear(aoutput_dim, dH, bias=False)
-        self.WK = nn.Linear(doutput_dim, dH, bias=False)
-        self.WV = nn.Linear(doutput_dim, dH, bias=False)
+        self.WQ = nn.Linear(audio_dim, dH, bias=False)
+        self.WK = nn.Linear(demo_dim, dH, bias=False)
+        self.WV = nn.Linear(demo_dim, dH, bias=False)
         self.classifier = nn.Linear(dH, 2)
 
-    def forward(self, audio_data, attention_mask, demographic_data):
-        a_encoded = self.aud_encoder(audio_data, attention_mask=attention_mask).extract_features
-        a_encoded = torch.mean(a_encoded, dim=1)          # [B, 768]
-        a_encoded = F.dropout(a_encoded, p=0.1)
-        d_encoded = self.demographic_enc(demographic_data) # [B, doutput_dim]
-        Q = self.WQ(a_encoded)  # [B, dH]
-        K = self.WK(d_encoded)  # [B, dH]
-        V = self.WV(d_encoded)  # [B, dH]
-        
-        scale = torch.sqrt(torch.tensor(K.shape[-1], dtype=torch.float32, device=K.device))
-        sim = (Q * K).sum(dim=-1, keepdim=True)
-        attn = torch.sigmoid(sim / scale)
-        attn = attn * V
-        return self.classifier(attn)
+        self.attn = nn.MultiheadAttention(embed_dim=dH, num_heads=1, batch_first=True)
+    
+    def forward(self, audio_signals, demographics):
+        z_a = self.aud_encoder(audio_signals).extract_features # [B, T, dAudio]
+        z_d = self.demographic_enc(demographics).unsqueeze(1) # [B, 1, dDemo]
+        Q = self.WQ(z_a) # [B, T, dH]
+        K = self.WK(z_d) # [B, T, dH]
+        V = self.WV(z_d) # [B, T, dH]
 
+        attn_output, _ = self.attn(Q, K, V) # [B, T, dH]
+        pooled = torch.mean(attn_output, dim=1)
+        logits = self.classifier(pooled)
+        return logits
+        
 class Wav2VecBase(nn.Module):
+    """
+    Base classifier model using Wav2Vec2 for audio feature extraction.
+    Conv + Linear layer 
+    """
     def __init__(self, config, output_dim=512):
         super().__init__()
         self.encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
@@ -68,3 +73,30 @@ class Wav2VecBase(nn.Module):
         encoded = torch.mean(encoded, dim=1)
         encoded = self.classifier(F.dropout(encoded, p=0.1))
         return encoded
+
+class FocalLoss(nn.Module):
+    """
+    Focal loss to handle class imbalance.
+    alpha: weight for the class
+    gamma: focusing parameter to reduce the loss contribution from easy examples
+    logits: whether the inputs are logits or probabilities
+    """
+    def __init__(self, alpha=1, gamma=2, logits=False, reduce=True):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.logits = logits
+        self.reduce = reduce
+
+    def forward(self, inputs, targets):
+        if self.logits:
+            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        else:
+            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+
+        if self.reduce:
+            return torch.mean(F_loss)
+        else:
+            return F_loss

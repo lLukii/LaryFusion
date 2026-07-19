@@ -22,7 +22,6 @@ from math import sqrt
 
 
 Linear = nn.Linear
-ConvTranspose2d = nn.ConvTranspose2d
 
 
 def Conv1d(*args, **kwargs):
@@ -69,35 +68,20 @@ class DiffusionEmbedding(nn.Module):
     return table
 
 
-class SpectrogramUpsampler(nn.Module):
-  def __init__(self, n_mels):
-    super().__init__()
-    self.conv1 = ConvTranspose2d(1, 1, [3, 32], stride=[1, 16], padding=[1, 8])
-    self.conv2 = ConvTranspose2d(1, 1,  [3, 32], stride=[1, 16], padding=[1, 8])
-
-  def forward(self, x):
-    x = torch.unsqueeze(x, 1)
-    x = self.conv1(x)
-    x = F.leaky_relu(x, 0.4)
-    x = self.conv2(x)
-    x = F.leaky_relu(x, 0.4)
-    x = torch.squeeze(x, 1)
-    return x
-
-
 class ResidualBlock(nn.Module):
-  def __init__(self, n_mels, residual_channels, dilation, uncond=False):
+  def __init__(self, label_dim, residual_channels, dilation, uncond=False):
     '''
-    :param n_mels: inplanes of conv1x1 for spectrogram conditional
+    :param label_dim: dimension of the shared label embedding (dlabel in the paper)
     :param residual_channels: audio conv
     :param dilation: audio conv dilation
-    :param uncond: disable spectrogram conditional
+    :param uncond: disable class-conditional embedding
     '''
     super().__init__()
     self.dilated_conv = Conv1d(residual_channels, 2 * residual_channels, 3, padding=dilation, dilation=dilation)
     self.diffusion_projection = Linear(512, residual_channels)
     if not uncond: # conditional model
-      self.conditioner_projection = Conv1d(n_mels, 2 * residual_channels, 1)
+      # layer-specific Conv1x1 mapping the shared label embedding to 2C channels
+      self.conditioner_projection = Conv1d(label_dim, 2 * residual_channels, 1)
     else: # unconditional model
       self.conditioner_projection = None
 
@@ -109,11 +93,11 @@ class ResidualBlock(nn.Module):
 
     diffusion_step = self.diffusion_projection(diffusion_step).unsqueeze(-1)
     y = x + diffusion_step
-    if self.conditioner_projection is None: # using a unconditional model
-      y = self.dilated_conv(y)
-    else:
-      conditioner = self.conditioner_projection(conditioner)
-      y = self.dilated_conv(y) + conditioner
+    y = self.dilated_conv(y)
+    if self.conditioner_projection is not None: # using a class-conditional model
+      # broadcast the per-class embedding as a bias term after the dilated conv
+      conditioner = self.conditioner_projection(conditioner.unsqueeze(-1))
+      y = y + conditioner
 
     gate, filter = torch.chunk(y, 2, dim=1)
     y = torch.sigmoid(gate) * torch.tanh(filter)
@@ -124,38 +108,39 @@ class ResidualBlock(nn.Module):
 
 
 class DiffWave(nn.Module):
-  def __init__(self, params):
+  def __init__(self, params, n_classes=2, label_dim=128):
     super().__init__()
     self.params = params
     self.input_projection = Conv1d(1, params.residual_channels, 1)
     self.diffusion_embedding = DiffusionEmbedding(len(params.noise_schedule))
     if self.params.unconditional: # use unconditional model
-      self.spectrogram_upsampler = None
+      self.label_embedding = None
     else:
-      self.spectrogram_upsampler = SpectrogramUpsampler(params.n_mels)
+      # shared embedding table (dlabel = 128 per the paper)
+      self.label_embedding = nn.Embedding(n_classes, label_dim)
 
     self.residual_layers = nn.ModuleList([
-        ResidualBlock(params.n_mels, params.residual_channels, 2**(i % params.dilation_cycle_length), uncond=params.unconditional)
+        ResidualBlock(label_dim, params.residual_channels, 2**(i % params.dilation_cycle_length), uncond=params.unconditional)
         for i in range(params.residual_layers)
     ])
     self.skip_projection = Conv1d(params.residual_channels, params.residual_channels, 1)
     self.output_projection = Conv1d(params.residual_channels, 1, 1)
     nn.init.zeros_(self.output_projection.weight)
 
-  def forward(self, audio, diffusion_step, spectrogram=None):
-    assert (spectrogram is None and self.spectrogram_upsampler is None) or \
-           (spectrogram is not None and self.spectrogram_upsampler is not None)
+  def forward(self, audio, diffusion_step, label=None):
+    assert (label is None and self.label_embedding is None) or \
+           (label is not None and self.label_embedding is not None)
     x = audio.unsqueeze(1)
     x = self.input_projection(x)
     x = F.relu(x)
 
     diffusion_step = self.diffusion_embedding(diffusion_step)
-    if self.spectrogram_upsampler: # use conditional model
-      spectrogram = self.spectrogram_upsampler(spectrogram)
+    if self.label_embedding is not None: # use conditional model
+      label = self.label_embedding(label)
 
     skip = None
     for layer in self.residual_layers:
-      x, skip_connection = layer(x, diffusion_step, spectrogram)
+      x, skip_connection = layer(x, diffusion_step, label)
       skip = skip_connection if skip is None else skip_connection + skip
 
     x = skip / sqrt(len(self.residual_layers))

@@ -120,7 +120,7 @@ class DiffWaveLearner:
       param.grad = None
 
     audio = features['audio']
-    spectrogram = features['spectrogram']
+    label = features['label']
 
     N, T = audio.shape
     device = audio.device
@@ -133,7 +133,7 @@ class DiffWaveLearner:
       noise = torch.randn_like(audio)
       noisy_audio = noise_scale_sqrt * audio + (1.0 - noise_scale)**0.5 * noise
 
-      predicted = self.model(noisy_audio, t, spectrogram)
+      predicted = self.model(noisy_audio, t, label)
       loss = self.loss_fn(noise, predicted.squeeze(1))
 
     self.scaler.scale(loss).backward()
@@ -147,7 +147,7 @@ class DiffWaveLearner:
     writer = self.summary_writer or SummaryWriter(self.model_dir, purge_step=step)
     writer.add_audio('feature/audio', features['audio'][0], step, sample_rate=self.params.sample_rate)
     if not self.params.unconditional:
-      writer.add_image('feature/spectrogram', torch.flip(features['spectrogram'][:1], [1]), step)
+      writer.add_histogram('feature/label', features['label'], step)
     writer.add_scalar('train/loss', loss, step)
     writer.add_scalar('train/grad_norm', self.grad_norm, step)
     writer.flush()
