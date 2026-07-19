@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from transformers import Wav2Vec2Model
 
 class AFT(nn.Module):
+    '''
+    (Deprecated)
+    '''
     def __init__(self, config, hidden_size=512, embedding_size=256): 
         super().__init__()
         self.encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
@@ -25,38 +28,61 @@ class AFT(nn.Module):
         disc_probs = self.discriminator(encoded)
         return label_probs, disc_probs
 
-class MultimodalFusion(nn.Module):
+class FusionModule(nn.Module):
     """
-    Cross-attention Multimodal Fusion Model for Audio and Demographic Data
+    Multimodal Fusion Model for Audio and Demographic Data
     """
-    def __init__(self, config, audio_dim=512, num_features=64, demo_dim=256, dH=128):
+    def __init__(self, config, num_features, hidden_dim=512):
         super().__init__()
         self.demographic_enc = nn.Sequential(
-            nn.Linear(num_features, demo_dim),
+            nn.Linear(num_features, hidden_dim),
             nn.ReLU(),
-            nn.Linear(demo_dim, demo_dim)
+            nn.Dropout(p=0.1),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(demo_dim, demo_dim)
+            nn.Dropout(p=0.1),
+            nn.Linear(hidden_dim, hidden_dim)
         )
         self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
-        self.WQ = nn.Linear(audio_dim, dH, bias=False)
-        self.WK = nn.Linear(demo_dim, dH, bias=False)
-        self.WV = nn.Linear(demo_dim, dH, bias=False)
-        self.classifier = nn.Linear(dH, 2)
+        self.classifier = nn.Linear(2 * hidden_dim, 2)
 
-        self.attn = nn.MultiheadAttention(embed_dim=dH, num_heads=1, batch_first=True)
-    
-    def forward(self, audio_signals, demographics):
-        z_a = self.aud_encoder(audio_signals).extract_features # [B, T, dAudio]
-        z_d = self.demographic_enc(demographics).unsqueeze(1) # [B, 1, dDemo]
-        Q = self.WQ(z_a) # [B, T, dH]
-        K = self.WK(z_d) # [B, T, dH]
-        V = self.WV(z_d) # [B, T, dH]
+    def forward(self, audio, demographic):
+        z_A = self.aud_encoder(audio)
+        encoded = torch.mean(encoded, dim=1)
+        z_D = self.demographic_enc(demographic)
+        concat = torch.cat(z_A, z_D)
+        outputs = self.classifier(F.dropout(concat, p=0.1))
+        return outputs
 
-        attn_output, _ = self.attn(Q, K, V) # [B, T, dH]
-        pooled = torch.mean(attn_output, dim=1)
-        logits = self.classifier(pooled)
-        return logits
+class GatedNetwork(nn.Module):
+    """
+    Multimodal Fusion Model for Audio and Demographic Data
+    """
+    def __init__(self, config, num_features, mlp_dim=128, audio_dim=512, gated_dim=128):
+        super().__init__()
+        self.demographic_cls = nn.Sequential(
+            nn.Linear(num_features, mlp_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(mlp_dim, 2)
+        )
+        self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
+        self.classifier = nn.Linear(audio_dim, 2)
+        self.gated_network = nn.Sequential(
+            nn.Linear(4, gated_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(gated_dim, 2)
+        )
+
+    def forward(self, audio, demographic):
+        z_A = self.aud_encoder(audio).extract_features
+        z_A = torch.mean(z_A, dim=1)
+        logits_A = self.classifier(z_A)
+        logits_D = self.demographic_cls(demographic)
+        combined = torch.cat((logits_A, logits_D), dim=-1) # [B, 4]
+        weights = F.softmax(self.gated_network(combined), dim=-1) # [B, 2]
+        return logits_A * weights[:, 0:1] + logits_D * weights[:, 1:2]
         
 class Wav2VecBase(nn.Module):
     """
@@ -68,8 +94,8 @@ class Wav2VecBase(nn.Module):
         self.encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
         self.classifier = nn.Linear(output_dim, 2)
     
-    def forward(self, signals, masks, demographics=None): 
-        encoded = self.encoder(signals, attention_mask=masks).extract_features
+    def forward(self, signals, demographics=None): 
+        encoded = self.encoder(signals).extract_features
         encoded = torch.mean(encoded, dim=1)
         encoded = self.classifier(F.dropout(encoded, p=0.1))
         return encoded

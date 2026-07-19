@@ -35,7 +35,6 @@ def load_wavs(include_demographics=False):
                     "signal" : signal,
                     "attention_mask" : attn_mask,
                     "label" : 1 if voice_type in ["malignant", "synthetic"] else 0,
-                    "is_synthetic" : voice_type == "synthetic",
                     "background" : None
             }
     
@@ -49,11 +48,11 @@ def load_wavs(include_demographics=False):
                 user_id = row["ID"]
                 patients[user_id]["background"] = row.drop(["ID", "Disease category"])
         
-        # For synthetic patients, copy the background information from the original patient
-        for patient in patients.keys(): 
-            if patients[patient]["is_synthetic"]:
-                user_id = re.sub(r"_synth\d+$", "", patient)
-                patients[patient]["background"] = patients[user_id]["background"]
+        # # For synthetic patients, copy the background information from the original patient
+        # for patient in patients.keys(): 
+        #     if patients[patient]["is_synthetic"]:
+        #         user_id = re.sub(r"_synth\d+$", "", patient)
+        #         patients[patient]["background"] = patients[user_id]["background"]
 
     return patients
 

@@ -10,7 +10,14 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 from config import Config
 from dataset import load_wavs, batch_inputs, cross_validation
-from models import MultimodalFusion, AFT, Wav2VecBase
+from models import (
+    FusionModule, 
+    GatedNetwork,
+    AFT, 
+    Wav2VecBase,
+    FocalLoss
+)
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -95,6 +102,7 @@ def parse_args():
     parser.add_argument("--name", type=str, required=True, help="Name of your model")
     parser.add_argument("--use_lora", type=bool, default=False, help="Whether to use Low Rank Adaption (LoRA) fine-tuning")
     parser.add_argument("--model_type", type=int, default=0, help="Which model to use for training")
+    parser.add_argument("--loss", type=str, default="cross_entropy", help="Loss function to use for training")
     return parser.parse_args()
 
 
@@ -109,14 +117,20 @@ if __name__ == '__main__':
     dinput_dim = len(train_data[0]["background"])
     model = None
     if args.model_type == 0: 
-        model = MultimodalFusion(config, dinput_dim=dinput_dim).to(config.device)
+        model = FusionModule(config, dinput_dim=dinput_dim).to(config.device)
     elif args.model_type == 1: 
         model = AFT(config).to(config.device)
     elif args.model_type == 2: 
         model = Wav2VecBase(config).to(config.device)
+    elif args.model_type == 3:
+        model = GatedNetwork(config, dinput_dim).to(config.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = None
+    if args.loss == "cross_entropy":
+        loss_fn = nn.CrossEntropyLoss()
+    elif args.loss == "focal":
+        loss_fn = FocalLoss(logits=True)
 
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
@@ -124,6 +138,7 @@ if __name__ == '__main__':
     print(f"Model layout: {model}")
 
     best_f1 = 0
+    no_improv = 0
     for epoch in range(1, config.num_epochs + 1):
         tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer, loss_fn)
         val_loss, val_acc, val_f1, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
@@ -140,5 +155,11 @@ if __name__ == '__main__':
         if val_f1 > best_f1:
             print("Updating best model...")
             best_f1 = val_f1
+            no_improv = 0
             torch.save(model.state_dict(), f"checkpoints/{args.name}_best.pt")
             visualize(train_losses, val_losses, train_accs, val_accs, preds, labels)
+        else:
+            no_improv += 1
+            if no_improv >= config.patience:
+                print(f"No improvement in val f1 for {config.patience} epochs, stopping early.")
+                break

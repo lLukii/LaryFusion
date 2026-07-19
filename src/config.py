@@ -8,6 +8,7 @@ class Config:
     sampling_rate: int = 16000
     padding: int = 48000
     num_epochs: int = 10
+    patience: int = 5
     batch_size: int = 32
     dataset_path: str = "/Users/llukii/Desktop/School/Programming/Multimodal throat cancer/dataset"
     model_path: str = ""
