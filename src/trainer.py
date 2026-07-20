@@ -11,10 +11,8 @@ from argparse import ArgumentParser
 from config import Config
 from dataset import load_wavs, batch_inputs, cross_validation
 from models import (
-    FusionModule, 
+    FusionModule,
     GatedNetwork,
-    AFT, 
-    Wav2VecBase,
     FocalLoss
 )
 
@@ -27,14 +25,13 @@ config = Config()
 def train_epoch(args, loader, model, optimizer, loss_fn):
     model.train()
     total_loss, correct, total = 0, 0, 0
-    for signals, masks, demographics, labels in tqdm(loader, desc="Train", leave=False):
+    for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
         signals = signals.to(config.device)
-        masks = masks.to(config.device)
         demographics = demographics.to(config.device)
         labels = labels.to(config.device).long()
 
         optimizer.zero_grad()
-        logits = model(signals, masks, demographics)
+        logits = model(signals, demographics)
         loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
@@ -51,13 +48,12 @@ def eval_epoch(args, loader, model, loss_fn):
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels = [], []
     with torch.no_grad():
-        for signals, masks, demographics, labels in tqdm(loader, desc="Eval", leave=False):
+        for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
             signals = signals.to(config.device)
-            masks = masks.to(config.device)
             demographics = demographics.to(config.device)
             labels = labels.to(config.device).long()
 
-            logits = model(signals, masks, demographics)
+            logits = model(signals, demographics)
             loss = loss_fn(logits, labels)
 
             total_loss += loss.item()
@@ -116,12 +112,8 @@ if __name__ == '__main__':
 
     dinput_dim = len(train_data[0]["background"])
     model = None
-    if args.model_type == 0: 
-        model = FusionModule(config, dinput_dim=dinput_dim).to(config.device)
-    elif args.model_type == 1: 
-        model = AFT(config).to(config.device)
-    elif args.model_type == 2: 
-        model = Wav2VecBase(config).to(config.device)
+    if args.model_type == 0:
+        model = FusionModule(config, num_features=dinput_dim).to(config.device)
     elif args.model_type == 3:
         model = GatedNetwork(config, dinput_dim).to(config.device)
 

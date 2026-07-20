@@ -4,18 +4,27 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-import re
+import torchaudio.transforms as T
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from transformers import Wav2Vec2FeatureExtractor
 
 config = Config()
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
-
+spec_args = {
+    'sample_rate': 16000,
+    'win_length': 256 * 4,
+    'hop_length': 256,
+    'n_fft': 1024,
+    'f_min': 20.0,
+    'f_max': 16000 / 2.0,
+    'n_mels': 80,
+    'power': 1.0,
+    'normalized': True
+}
 
 def load_wavs(include_demographics=False): 
     patients = {}
+    spec_transform = T.MelSpectrogram(**spec_args)
     for voice_type in ["benign", "malignant", "normal", "synthetic"]:
         for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
             if sample.split(".")[-1] != "wav":
@@ -27,13 +36,10 @@ def load_wavs(include_demographics=False):
             else: 
                 signal = signal[:config.padding]
             
-            processed = feature_extractor(signal, sampling_rate=config.sampling_rate, return_attention_mask=True, 
-                return_tensors="pt")
-            signal = processed.input_values
-            attn_mask = processed.attention_mask
+            mel_spectrogram = spec_transform(torch.tensor(signal, dtype=torch.float32).unsqueeze(0))
             patients[user_id] = {
+                    "spec" : mel_spectrogram,
                     "signal" : signal,
-                    "attention_mask" : attn_mask,
                     "label" : 1 if voice_type in ["malignant", "synthetic"] else 0,
                     "background" : None
             }
@@ -47,12 +53,6 @@ def load_wavs(include_demographics=False):
             for _, row in medical_history.iterrows():
                 user_id = row["ID"]
                 patients[user_id]["background"] = row.drop(["ID", "Disease category"])
-        
-        # # For synthetic patients, copy the background information from the original patient
-        # for patient in patients.keys(): 
-        #     if patients[patient]["is_synthetic"]:
-        #         user_id = re.sub(r"_synth\d+$", "", patient)
-        #         patients[patient]["background"] = patients[user_id]["background"]
 
     return patients
 
@@ -65,8 +65,8 @@ def cross_validation(dataset):
         bg_cols = train_data[0]["background"].index
         quant_cols = [col for col in bg_cols
                       if pd.Series([p["background"][col] for p in train_data]).nunique() > 2] 
+        
         # only normalize non-binary rows
-
         train_bg = pd.DataFrame([p["background"] for p in train_data])
         scaler = StandardScaler()
         scaler.fit(train_bg[quant_cols])
@@ -91,13 +91,13 @@ class ThroatCancerDataset(Dataset):
         p = self.data[idx]
         demo = (torch.tensor(p["background"].values.astype(float), dtype=torch.float32)
                 if p["background"] is not None else None)
-        return p["signal"].squeeze(0), p["attention_mask"].squeeze(0), demo, self.labels[idx]
+        return p["spec"], demo, self.labels[idx]
 
 
 def collate_fn(batch):
-    signals, masks, demos, labels = zip(*batch)
+    specs, demos, labels = zip(*batch)
     demographics = torch.stack(demos) if demos[0] is not None else None
-    return torch.stack(signals), torch.stack(masks), demographics, torch.stack(list(labels)), 
+    return torch.stack(specs), demographics, torch.stack(list(labels))
 
 
 def batch_inputs(data, oversample=False, shuffle=False):
