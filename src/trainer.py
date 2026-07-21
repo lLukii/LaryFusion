@@ -114,7 +114,7 @@ if __name__ == '__main__':
     model = None
     if args.model_type == 0:
         model = FusionModule(config, num_features=dinput_dim).to(config.device)
-    elif args.model_type == 3:
+    elif args.model_type == 1:
         model = GatedNetwork(config, dinput_dim).to(config.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
@@ -128,6 +128,7 @@ if __name__ == '__main__':
     train_accs, val_accs = [], []
 
     print(f"Model layout: {model}")
+    print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
     best_f1 = 0
     no_improv = 0

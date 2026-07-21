@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from copy import deepcopy
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride = 1, downsample = None):
@@ -33,7 +34,7 @@ class ResNet(nn.Module):
         super(ResNet, self).__init__()
         self.inplanes = 64
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size = 7, stride = 2, padding = 3),
+            nn.Conv2d(1, 64, kernel_size = 7, stride = 2, padding = 3),
             nn.BatchNorm2d(64),
             nn.ReLU())
         self.maxpool = nn.MaxPool2d(kernel_size = 3, stride = 2, padding = 1)
@@ -41,7 +42,7 @@ class ResNet(nn.Module):
         self.layer1 = self._make_layer(block, 128, layers[1], stride = 2)
         self.layer2 = self._make_layer(block, 256, layers[2], stride = 2)
         self.layer3 = self._make_layer(block, 512, layers[3], stride = 2)
-        self.avgpool = nn.AvgPool2d(7, stride=1)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, hidden_dim)
 
     def _make_layer(self, block, planes, blocks, stride=1):
@@ -90,21 +91,22 @@ class FusionModule(nn.Module):
         )
         self.aud_encoder = ResNet()
         self.classifier = nn.Linear(2 * hidden_dim, 2)
-        self.gate_nn = nn.Sequential(
+        self.gate_a = nn.Sequential(
             nn.Linear(2 * hidden_dim, 2 * hidden_dim), 
             nn.ReLU(),
             nn.Dropout(p=0.1),
             nn.Linear(2 * hidden_dim, 2 * hidden_dim)
         ) if gate else None
+        self.gate_b = deepcopy(self.gate_a)
 
     def forward(self, audio, demographic):
         z_A = self.aud_encoder(audio)
         z_D = self.demographic_enc(demographic)
-        size = z_A.shape[1]
         concat = torch.cat((z_A, z_D), dim=-1)
         if self.gate_nn: 
-            weights = F.softmax(self.gate_nn(concat), dim=-1)
-            concat = z_A * weights[:, :size] + z_D * weights[:, size:]
+            A = self.gate_a(concat)
+            B = F.sigmoid(self.gate_b(concat)) # [B, 2 * dim]
+            concat = A * B # [B, 2 * dim]
 
         outputs = self.classifier(F.dropout(concat, p=0.1))
         return outputs
