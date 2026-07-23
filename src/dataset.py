@@ -16,7 +16,7 @@ feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
 
 def load_wavs(include_demographics=False): 
     patients = {}
-    for voice_type in ["benign", "malignant", "normal", "synthetic"]:
+    for voice_type in ["benign", "malignant", "normal"]:
         for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
             if sample.split(".")[-1] != "wav":
                 continue
@@ -27,13 +27,11 @@ def load_wavs(include_demographics=False):
             else: 
                 signal = signal[:config.padding]
             
-            processed = feature_extractor(signal, sampling_rate=config.sampling_rate, return_attention_mask=True, 
+            processed = feature_extractor(signal, sampling_rate=config.sampling_rate,  
                 return_tensors="pt")
             signal = processed.input_values
-            attn_mask = processed.attention_mask
             patients[user_id] = {
                     "signal" : signal,
-                    "attention_mask" : attn_mask,
                     "label" : 1 if voice_type in ["malignant", "synthetic"] else 0,
                     "background" : None
             }
@@ -91,13 +89,13 @@ class ThroatCancerDataset(Dataset):
         p = self.data[idx]
         demo = (torch.tensor(p["background"].values.astype(float), dtype=torch.float32)
                 if p["background"] is not None else None)
-        return p["signal"].squeeze(0), p["attention_mask"].squeeze(0), demo, self.labels[idx]
+        return p["signal"].squeeze(0), demo, self.labels[idx]
 
 
 def collate_fn(batch):
-    signals, masks, demos, labels = zip(*batch)
+    signals, demos, labels = zip(*batch)
     demographics = torch.stack(demos) if demos[0] is not None else None
-    return torch.stack(signals), torch.stack(masks), demographics, torch.stack(list(labels)), 
+    return torch.stack(signals), demographics, torch.stack(list(labels)), 
 
 
 def batch_inputs(data, oversample=False, shuffle=False):
