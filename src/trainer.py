@@ -11,30 +11,28 @@ from argparse import ArgumentParser
 from config import Config
 from dataset import load_wavs, batch_inputs, cross_validation
 from models import (
-    FusionModule, 
-    GatedNetwork,
-    AFT, 
+    FusionModule,
     Wav2VecBase,
-    FocalLoss
+    FocalLoss,
+    ResNet
 )
 
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
-
+torch.manual_seed(1337)
 
 def train_epoch(args, loader, model, optimizer, loss_fn):
     model.train()
     total_loss, correct, total = 0, 0, 0
-    for signals, masks, demographics, labels in tqdm(loader, desc="Train", leave=False):
+    for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
         signals = signals.to(config.device)
-        masks = masks.to(config.device)
         demographics = demographics.to(config.device)
         labels = labels.to(config.device).long()
 
         optimizer.zero_grad()
-        logits = model(signals, masks, demographics)
+        logits = model(signals, demographics)
         loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
@@ -51,13 +49,12 @@ def eval_epoch(args, loader, model, loss_fn):
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels = [], []
     with torch.no_grad():
-        for signals, masks, demographics, labels in tqdm(loader, desc="Eval", leave=False):
+        for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
             signals = signals.to(config.device)
-            masks = masks.to(config.device)
             demographics = demographics.to(config.device)
             labels = labels.to(config.device).long()
 
-            logits = model(signals, masks, demographics)
+            logits = model(signals, demographics)
             loss = loss_fn(logits, labels)
 
             total_loss += loss.item()
@@ -103,6 +100,7 @@ def parse_args():
     parser.add_argument("--use_lora", type=bool, default=False, help="Whether to use Low Rank Adaption (LoRA) fine-tuning")
     parser.add_argument("--model_type", type=int, default=0, help="Which model to use for training")
     parser.add_argument("--loss", type=str, default="cross_entropy", help="Loss function to use for training")
+    parser.add_argument("--results_name", type=str, default="results", help="What to name the result diagram")
     return parser.parse_args()
 
 
@@ -116,14 +114,12 @@ if __name__ == '__main__':
 
     dinput_dim = len(train_data[0]["background"])
     model = None
-    if args.model_type == 0: 
-        model = FusionModule(config, dinput_dim=dinput_dim).to(config.device)
-    elif args.model_type == 1: 
-        model = AFT(config).to(config.device)
+    if args.model_type == 0:
+        model = FusionModule(config, num_features=dinput_dim).to(config.device)
+    elif args.model_type == 1:
+        model = FusionModule(config, num_features=dinput_dim, gate=True).to(config.device)
     elif args.model_type == 2: 
         model = Wav2VecBase(config).to(config.device)
-    elif args.model_type == 3:
-        model = GatedNetwork(config, dinput_dim).to(config.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     loss_fn = None
@@ -136,6 +132,7 @@ if __name__ == '__main__':
     train_accs, val_accs = [], []
 
     print(f"Model layout: {model}")
+    print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
     best_f1 = 0
     no_improv = 0
@@ -158,6 +155,7 @@ if __name__ == '__main__':
             no_improv = 0
             torch.save(model.state_dict(), f"checkpoints/{args.name}_best.pt")
             visualize(train_losses, val_losses, train_accs, val_accs, preds, labels)
+
         else:
             no_improv += 1
             if no_improv >= config.patience:
