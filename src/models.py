@@ -59,32 +59,6 @@ class Wav2VecBase(nn.Module):
         encoded = self.classifier(F.dropout(encoded, p=0.1))
         return encoded
 
-class FocalLoss(nn.Module):
-    """
-    Focal loss to handle class imbalance.
-    alpha: weight for the class
-    gamma: focusing parameter to reduce the loss contribution from easy examples
-    logits: whether the inputs are logits or probabilities
-    """
-    def __init__(self, alpha=1, gamma=2, logits=False, reduce=True):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.logits = logits
-        self.reduce = reduce
-
-    def forward(self, inputs, targets):
-        if self.logits:
-            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        else:
-            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
-
-        if self.reduce:
-            return torch.mean(F_loss)
-        else:
-            return F_loss
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride = 1, downsample = None):
@@ -146,3 +120,70 @@ class ResNet(nn.Module):
             layers.append(block(self.inplanes, planes))
 
         return nn.Sequential(*layers)
+
+class VAE(nn.Module):
+    '''
+    Variational autoencoder implementation for generating latent samples
+    '''
+    def __init__(self, input_dim=1024, hidden_dim=512, latent_dim=8):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
+        )
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_std = nn.Linear(hidden_dim, latent_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def encode(self, x):
+        h = self.encoder(x)
+        mu = self.fc_mu(h)
+        # Softplus + epsilon for stable std deviation
+        std = F.softplus(self.fc_std(h)) + 1e-6
+        return mu, std
+
+    def reparameterize(self, mu, std):
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x, kl_weight=1.0):
+        mu, std = self.encode(x)
+        z = self.reparameterize(mu, std)
+        x_recon = self.decode(z)
+
+class AugmentedFusion(FusionModule): 
+    def __init__(self, config):
+        super().__init__()
+        self.generator = VAE()
+
+    def forward(self, audio, demographic): 
+        z_A = self.aud_encoder(audio).extract_features
+        z_A = torch.mean(z_A, dim=1)
+        z_D = self.demographic_enc(demographic)
+
+        concat = torch.cat((z_A, z_D), dim=-1)
+        recons = self.generator(concat)
+        output = self.classifier(F.dropout(concat, p=0.1))
+        r_output = self.classifier(F.dropout(recons, p=0.1))
+        return output, r_output
+
+    def freeze_grad(self, generate=False): 
+        for module in self.children(): 
+            if isinstance(module, VAE): 
+                for p in self.parameters(): 
+                    p.requires_grad = generate
+            else: 
+                for p in self.parameters(): 
+                    p.requires_grad = not generate

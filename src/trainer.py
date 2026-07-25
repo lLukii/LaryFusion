@@ -13,7 +13,7 @@ from dataset import load_wavs, batch_inputs, cross_validation
 from models import (
     FusionModule,
     Wav2VecBase,
-    FocalLoss,
+    AugmentedFusion,
     ResNet
 )
 
@@ -67,6 +67,32 @@ def eval_epoch(args, loader, model, loss_fn):
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     return total_loss / len(loader), correct / total, f1, all_preds, all_labels
 
+def train_augmented_epoch(args, loader, model, task_fn, gen_fn): 
+    model.train()
+    total_task_loss, total_gen_loss, correct, total = 0, 0, 0, 0
+    for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
+        signals = signals.to(config.device)
+        demographics = demographics.to(config.device)
+        labels = labels.to(config.device).long()
+
+        optimizer.zero_grad()
+        model.freeze_grad(False)
+        original, reconstructed = model(signals, demographics)
+        task_loss = task_fn(original, labels) + task_fn(reconstructed, labels)
+        task_loss.backward()
+
+        optimizer.zero_grad()
+        model.freeze_grad(True)
+        gen_loss = gen_fn(original, reconstructed) + task_fn(reconstructed, labels)
+        gen_loss.backward()
+
+        total_gen_loss += gen_loss.item()
+        total_task_loss += task_loss.item()
+        correct += (original.argmax(dim=-1) == labels).sum().item() + (original.argmax(dim=-1) == labels).sum().item()
+        total += len(labels)
+
+    return total_task_loss / len(loader), total_gen_loss / len(total), correct / total
+
 
 def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels):
     epochs = range(1, len(train_losses) + 1)
@@ -107,7 +133,7 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    dataset = load_wavs(include_demographics=True)
+    dataset = load_wavs(include_demographics=True, as_spectrogram=args.model_type==3)
     train_data, test_data = cross_validation(dataset)
     train_loader = batch_inputs(train_data, oversample=True, shuffle=True)
     test_loader = batch_inputs(test_data)
@@ -120,14 +146,14 @@ if __name__ == '__main__':
         model = FusionModule(config, num_features=dinput_dim, gate=True).to(config.device)
     elif args.model_type == 2: 
         model = Wav2VecBase(config).to(config.device)
+    elif args.model_type == 3: 
+        model = ResNet().to(config.device)
+    elif args.model_type == 4: 
+        model = AugmentedFusion().to(config.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    loss_fn = None
-    if args.loss == "cross_entropy":
-        loss_fn = nn.CrossEntropyLoss()
-    elif args.loss == "focal":
-        loss_fn = FocalLoss(logits=True)
-
+    loss_fn, gen_fn = nn.CrossEntropyLoss(), nn.KLDivLoss()
+    
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
 

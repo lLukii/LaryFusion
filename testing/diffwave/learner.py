@@ -23,8 +23,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import from_path, from_gtzan
-from model import DiffWave
-from params import AttrDict
+from testing.diffwave.model import DiffWave
+from testing.diffwave.params import AttrDict
 
 
 def _nested_map(struct, map_fn):

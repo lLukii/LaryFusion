@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torchaudio
 
-from diffwave.inference import predict
+from testing.diffwave.inference import predict
 
 DEFAULT_MODEL_PATH = "checkpoints/weights.pt"
 DEFAULT_SOURCE_DIR = "dataset"
