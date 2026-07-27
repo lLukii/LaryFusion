@@ -162,28 +162,50 @@ class VAE(nn.Module):
         mu, std = self.encode(x)
         z = self.reparameterize(mu, std)
         x_recon = self.decode(z)
+        return x_recon
 
-class AugmentedFusion(FusionModule): 
-    def __init__(self, config):
-        super().__init__()
-        self.generator = VAE()
+    def kl_loss(self, mu, std):
+        """KL divergence of N(mu, std^2) against the standard normal prior."""
+        var = std.pow(2)
+        kl = -0.5 * torch.sum(1 + torch.log(var + 1e-8) - mu.pow(2) - var, dim=-1)
+        return kl.mean()
 
-    def forward(self, audio, demographic): 
+class AugmentedFusion(FusionModule):
+    """
+    LeMDA-style feature-space augmentation: a VAE learns to generate adversarial
+    but label-preserving latent vectors for the fused audio + demographic features.
+    """
+    def __init__(self, config, num_features, hidden_dim=512, gate=False):
+        super().__init__(config, num_features, hidden_dim, gate)
+        self.generator = VAE(input_dim=2 * hidden_dim)
+
+    def forward(self, audio, demographic, reconstruct=False):
         z_A = self.aud_encoder(audio).extract_features
         z_A = torch.mean(z_A, dim=1)
         z_D = self.demographic_enc(demographic)
-
         concat = torch.cat((z_A, z_D), dim=-1)
-        recons = self.generator(concat)
-        output = self.classifier(F.dropout(concat, p=0.1))
-        r_output = self.classifier(F.dropout(recons, p=0.1))
-        return output, r_output
+        if self.gate_a:
+            A = self.gate_a(concat)
+            B = F.sigmoid(self.gate_b(concat))
+            concat = A * B
 
-    def freeze_grad(self, generate=False): 
-        for module in self.children(): 
-            if isinstance(module, VAE): 
-                for p in self.parameters(): 
-                    p.requires_grad = generate
-            else: 
-                for p in self.parameters(): 
-                    p.requires_grad = not generate
+        output = self.classifier(F.dropout(concat, p=0.1))
+        # Reconstruction only necessary for training. Just pass in data during inference.
+        if reconstruct:
+            mu, std = self.generator.encode(concat)
+            z_aug = self.generator.reparameterize(mu, std)
+            recon = self.generator.decode(z_aug)
+            r_output = self.classifier(F.dropout(recon, p=0.1))
+            return output, r_output, mu, std
+
+        return output
+
+    def freeze_grad(self, generate=False):
+        """
+        generate=False -> train the task network (encoders + classifier), freeze the VAE.
+        generate=True  -> train the VAE generator, freeze the task network.
+        """
+        for module in self.children():
+            requires_grad = generate if isinstance(module, VAE) else not generate
+            for p in module.parameters():
+                p.requires_grad = requires_grad

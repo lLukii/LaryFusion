@@ -56,12 +56,6 @@ def load_wavs(include_demographics=False, as_spectrogram=False):
             for _, row in medical_history.iterrows():
                 user_id = row["ID"]
                 patients[user_id]["background"] = row.drop(["ID", "Disease category"])
-        
-        # # For synthetic patients, copy the background information from the original patient
-        # for patient in patients.keys(): 
-        #     if patients[patient]["is_synthetic"]:
-        #         user_id = re.sub(r"_synth\d+$", "", patient)
-        #         patients[patient]["background"] = patients[user_id]["background"]
 
     return patients
 

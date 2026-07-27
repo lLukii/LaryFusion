@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
     confusion_matrix, 
@@ -67,34 +68,56 @@ def eval_epoch(args, loader, model, loss_fn):
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     return total_loss / len(loader), correct / total, f1, all_preds, all_labels
 
-def train_augmented_epoch(args, loader, model, task_fn, gen_fn): 
+def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, task_fn, consist_fn,
+                           alpha=0.5, w1=1e-4, w2=0.1, w3=0.1):
+    """
+    LeMDA training step (Liu et al., 2022)
+    """
     model.train()
-    total_task_loss, total_gen_loss, correct, total = 0, 0, 0, 0
-    for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
+    total_loss, correct, total = 0, 0, 0
+    for signals, demographics, labels in tqdm(loader, desc="Train (LeMDA)", leave=False):
         signals = signals.to(config.device)
         demographics = demographics.to(config.device)
         labels = labels.to(config.device).long()
 
-        optimizer.zero_grad()
-        model.freeze_grad(False)
-        original, reconstructed = model(signals, demographics)
-        task_loss = task_fn(original, labels) + task_fn(reconstructed, labels)
-        task_loss.backward()
+        # Task Network update
+        model.freeze_grad(generate=False)
+        task_optimizer.zero_grad()
+        output, r_output, _, _ = model(signals, demographics, reconstruct=True)
+        loss_task = task_fn(output, labels) + task_fn(r_output, labels)
+        loss_task.backward()
+        task_optimizer.step()
 
-        optimizer.zero_grad()
-        model.freeze_grad(True)
-        gen_loss = gen_fn(original, reconstructed) + task_fn(reconstructed, labels)
-        gen_loss.backward()
+        # Augmentation Network update
+        model.freeze_grad(generate=True)
+        aug_optimizer.zero_grad()
+        output_g, r_output_g, mu, std = model(signals, demographics, reconstruct=True)
 
-        total_gen_loss += gen_loss.item()
-        total_task_loss += task_loss.item()
-        correct += (original.argmax(dim=-1) == labels).sum().item() + (original.argmax(dim=-1) == labels).sum().item()
+        with torch.no_grad():
+            confident = F.softmax(output_g, dim=-1).amax(dim=-1) > alpha
+
+        adv_loss = task_fn(r_output_g, labels)
+        if confident.any():
+            log_p_aug = F.log_softmax(r_output_g[confident], dim=-1)
+            p_orig = F.softmax(output_g[confident], dim=-1).detach()
+            consist_loss = consist_fn(log_p_aug, p_orig)
+        else:
+            consist_loss = torch.zeros((), device=config.device)
+        kl_loss = model.generator.kl_loss(mu, std)
+
+        loss_aug = -w1 * adv_loss + w2 * consist_loss + w3 * kl_loss
+        loss_aug.backward()
+        aug_optimizer.step()
+
+        model.freeze_grad(generate=False)  # leave task net trainable/unfrozen by default
+
+        total_loss += loss_task.item()
+        correct += (output.argmax(dim=-1) == labels).sum().item()
         total += len(labels)
 
-    return total_task_loss / len(loader), total_gen_loss / len(total), correct / total
+    return total_loss / len(loader), correct / total
 
-
-def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels):
+def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="results"):
     epochs = range(1, len(train_losses) + 1)
     _, axes = plt.subplots(1, 3, figsize=(16, 4))
 
@@ -116,7 +139,7 @@ def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_lab
     axes[2].set_title("Confusion Matrix")
 
     plt.tight_layout()
-    plt.savefig("graphs/results.png", dpi=150)
+    plt.savefig(f"graphs/{file_name}.png", dpi=150)
     plt.show()
 
 
@@ -148,12 +171,19 @@ if __name__ == '__main__':
         model = Wav2VecBase(config).to(config.device)
     elif args.model_type == 3: 
         model = ResNet().to(config.device)
-    elif args.model_type == 4: 
-        model = AugmentedFusion().to(config.device)
+    elif args.model_type == 4:
+        model = AugmentedFusion(config, num_features=dinput_dim).to(config.device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    loss_fn, gen_fn = nn.CrossEntropyLoss(), nn.KLDivLoss()
-    
+    loss_fn, gen_fn = nn.CrossEntropyLoss(), nn.KLDivLoss(reduction="batchmean")
+
+    aug_optimizer = None
+    if args.model_type == 4:
+        task_params = [p for n, p in model.named_parameters() if not n.startswith("generator.")]
+        optimizer = torch.optim.Adam(task_params, lr=config.lr)
+        aug_optimizer = torch.optim.Adam(model.generator.parameters(), lr=config.aug_lr)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
 
@@ -180,7 +210,7 @@ if __name__ == '__main__':
             best_f1 = val_f1
             no_improv = 0
             torch.save(model.state_dict(), f"checkpoints/{args.name}_best.pt")
-            visualize(train_losses, val_losses, train_accs, val_accs, preds, labels)
+            visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, args.results_name)
 
         else:
             no_improv += 1

@@ -14,4 +14,11 @@ class Config:
     model_path: str = ""
     w2v_name: str = "facebook/wav2vec2-base"
     pretrained: bool = True
-    lr: float = 1e-4
+
+    # LeMDA params
+    lr: float = 1e-3
+    aug_lr: float = 1e-3      
+    consist_alpha: float = 0.5 
+    aug_w1: float = 1e-4     
+    aug_w2: float = 0.1 
+    aug_w3: float = 0.1  
