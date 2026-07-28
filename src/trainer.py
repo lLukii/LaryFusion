@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
-    confusion_matrix, 
-    ConfusionMatrixDisplay, 
-    f1_score
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    roc_auc_score
 )
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -48,7 +48,7 @@ def train_epoch(args, loader, model, optimizer, loss_fn):
 def eval_epoch(args, loader, model, loss_fn):
     model.eval()
     total_loss, correct, total = 0, 0, 0
-    all_preds, all_labels = [], []
+    all_preds, all_labels, all_probs = [], [], []
     with torch.no_grad():
         for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
             signals = signals.to(config.device)
@@ -59,14 +59,19 @@ def eval_epoch(args, loader, model, loss_fn):
             loss = loss_fn(logits, labels)
 
             total_loss += loss.item()
+            probs = F.softmax(logits, dim=-1)[:, 1]
             preds = logits.argmax(dim=-1)
             correct += (preds == labels).sum().item()
             total += len(labels)
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
+            all_probs.extend(probs.cpu().tolist())
 
-    f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-    return total_loss / len(loader), correct / total, f1, all_preds, all_labels
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    auroc = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
+    return total_loss / len(loader), correct / total, sensitivity, specificity, auroc, all_preds, all_labels
 
 def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, task_fn, consist_fn,
                            alpha=0.5, w1=1e-4, w2=0.1, w3=0.1):
@@ -190,11 +195,11 @@ if __name__ == '__main__':
     print(f"Model layout: {model}")
     print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
-    best_f1 = 0
+    best_auroc = 0
     no_improv = 0
     for epoch in range(1, config.num_epochs + 1):
         tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer, loss_fn)
-        val_loss, val_acc, val_f1, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
+        val_loss, val_acc, val_sens, val_spec, val_auroc, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
 
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
@@ -203,11 +208,11 @@ if __name__ == '__main__':
 
         print(f"Epoch {epoch:02d} | "
             f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} f1: {val_f1:.3f}")
+            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auroc: {val_auroc:.3f}")
 
-        if val_f1 > best_f1:
+        if val_auroc > best_auroc:
             print("Updating best model...")
-            best_f1 = val_f1
+            best_auroc = val_auroc
             no_improv = 0
             torch.save(model.state_dict(), f"checkpoints/{args.name}_best.pt")
             visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, args.results_name)
@@ -215,5 +220,5 @@ if __name__ == '__main__':
         else:
             no_improv += 1
             if no_improv >= config.patience:
-                print(f"No improvement in val f1 for {config.patience} epochs, stopping early.")
+                print(f"No improvement in val auroc for {config.patience} epochs, stopping early.")
                 break

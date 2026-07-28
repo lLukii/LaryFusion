@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from transformers import Wav2Vec2FeatureExtractor
+from huggingface_hub import login
 
 config = Config()
 spec_args = {

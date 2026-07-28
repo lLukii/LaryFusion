@@ -17,13 +17,7 @@ class FusionModule(nn.Module):
         )
         self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
         self.classifier = nn.Linear(2 * hidden_dim, 2)
-        self.gate_a = nn.Sequential(
-            nn.Linear(2 * hidden_dim, 2 * hidden_dim), 
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(2 * hidden_dim, 2 * hidden_dim)
-        ) if gate else None
-        self.gate_b = nn.Sequential(
+        self.gate = nn.Sequential(
             nn.Linear(2 * hidden_dim, 2 * hidden_dim), 
             nn.ReLU(),
             nn.Dropout(p=0.1),
@@ -36,9 +30,8 @@ class FusionModule(nn.Module):
         z_D = self.demographic_enc(demographic)
         concat = torch.cat((z_A, z_D), dim=-1)
         if self.gate_a: 
-            A = self.gate_a(concat)
-            B = F.sigmoid(self.gate_b(concat)) # [B, 2 * dim]
-            concat = A * B # [B, 2 * dim]
+            B = F.sigmoid(self.gate(concat)) # [B, 2 * dim]
+            concat = concat * B # [B, 2 * dim]
 
         outputs = self.classifier(F.dropout(concat, p=0.1))
         return outputs
@@ -120,6 +113,20 @@ class ResNet(nn.Module):
             layers.append(block(self.inplanes, planes))
 
         return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        x = self.layer0(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+
+        return x
 
 class VAE(nn.Module):
     '''
@@ -209,3 +216,30 @@ class AugmentedFusion(FusionModule):
             requires_grad = generate if isinstance(module, VAE) else not generate
             for p in module.parameters():
                 p.requires_grad = requires_grad
+
+class FocalLoss(nn.Module):
+    """
+    Focal loss to handle class imbalance.
+    alpha: weight for the class
+    gamma: focusing parameter to reduce the loss contribution from easy examples
+    logits: whether the inputs are logits or probabilities
+    """
+    def __init__(self, alpha=1, gamma=2, logits=False, reduce=True):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.logits = logits
+        self.reduce = reduce
+
+    def forward(self, inputs, targets):
+        if self.logits:
+            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        else:
+            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+
+        if self.reduce:
+            return torch.mean(F_loss)
+        else:
+            return F_loss
