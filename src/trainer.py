@@ -15,7 +15,8 @@ from models import (
     FusionModule,
     Wav2VecBase,
     AugmentedFusion,
-    ResNet
+    ResNet, 
+    focal_loss
 )
 
 import warnings
@@ -24,17 +25,17 @@ warnings.filterwarnings("ignore")
 config = Config()
 torch.manual_seed(1337)
 
-def train_epoch(args, loader, model, optimizer, loss_fn):
+
+def train_epoch(args, loader, model, optimizer):
     model.train()
     total_loss, correct, total = 0, 0, 0
     for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
         signals = signals.to(config.device)
         demographics = demographics.to(config.device)
         labels = labels.to(config.device).long()
-
         optimizer.zero_grad()
         logits = model(signals, demographics)
-        loss = loss_fn(logits, labels)
+        loss = focal_loss(logits, labels)
         loss.backward()
         optimizer.step()
 
@@ -98,7 +99,7 @@ def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, ta
         aug_optimizer.zero_grad()
         output_g, r_output_g, mu, std = model(signals, demographics, reconstruct=True)
 
-        with torch.no_grad():
+        with torch.no_grad(): # only 
             confident = F.softmax(output_g, dim=-1).amax(dim=-1) > alpha
 
         adv_loss = task_fn(r_output_g, labels)
@@ -157,13 +158,11 @@ def parse_args():
     parser.add_argument("--results_name", type=str, default="results", help="What to name the result diagram")
     return parser.parse_args()
 
-
-if __name__ == '__main__':
+def main(): 
     args = parse_args()
-
     dataset = load_wavs(include_demographics=True, as_spectrogram=args.model_type==3)
     train_data, test_data = cross_validation(dataset)
-    train_loader = batch_inputs(train_data, oversample=True, shuffle=True)
+    train_loader = batch_inputs(train_data, shuffle=True)
     test_loader = batch_inputs(test_data)
 
     dinput_dim = len(train_data[0]["background"])
@@ -198,7 +197,7 @@ if __name__ == '__main__':
     best_auroc = 0
     no_improv = 0
     for epoch in range(1, config.num_epochs + 1):
-        tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer, loss_fn)
+        tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer)
         val_loss, val_acc, val_sens, val_spec, val_auroc, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
 
         train_losses.append(tr_loss)
@@ -222,3 +221,6 @@ if __name__ == '__main__':
             if no_improv >= config.patience:
                 print(f"No improvement in val auroc for {config.patience} epochs, stopping early.")
                 break
+
+if __name__ == '__main__':
+    main()

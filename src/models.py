@@ -29,7 +29,7 @@ class FusionModule(nn.Module):
         z_A = torch.mean(z_A, dim=1)
         z_D = self.demographic_enc(demographic)
         concat = torch.cat((z_A, z_D), dim=-1)
-        if self.gate_a: 
+        if self.gate: 
             B = F.sigmoid(self.gate(concat)) # [B, 2 * dim]
             concat = concat * B # [B, 2 * dim]
 
@@ -98,6 +98,7 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, 512, layers[3], stride = 2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 2)
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
@@ -114,7 +115,10 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, demographics=None):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)  # (B, 80, 188) -> (B, 1, 80, 188)
+
         x = self.conv1(x)
         x = self.maxpool(x)
         x = self.layer0(x)
@@ -125,6 +129,7 @@ class ResNet(nn.Module):
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
+        x = self.classifier(F.dropout(x, p=0.1))
 
         return x
 
@@ -217,29 +222,8 @@ class AugmentedFusion(FusionModule):
             for p in module.parameters():
                 p.requires_grad = requires_grad
 
-class FocalLoss(nn.Module):
-    """
-    Focal loss to handle class imbalance.
-    alpha: weight for the class
-    gamma: focusing parameter to reduce the loss contribution from easy examples
-    logits: whether the inputs are logits or probabilities
-    """
-    def __init__(self, alpha=1, gamma=2, logits=False, reduce=True):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.logits = logits
-        self.reduce = reduce
-
-    def forward(self, inputs, targets):
-        if self.logits:
-            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        else:
-            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
-
-        if self.reduce:
-            return torch.mean(F_loss)
-        else:
-            return F_loss
+def focal_loss(logits, labels, gamma=2.0, alpha=0.969):
+    ce = F.cross_entropy(logits, labels, reduction="none")
+    pt = torch.exp(-ce)
+    alpha_t = torch.where(labels == 1, alpha, 1 - alpha)
+    return (alpha_t * (1 - pt) ** gamma * ce).mean()
