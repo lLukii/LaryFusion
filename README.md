@@ -1,0 +1,8 @@
+# LaryFusion: Addressing data scarcity in non-invasive laryngeal cancer detection with multimodal feature learning. 
+### Yichen Jiao, Data Science Distinction
+### Abstract: 
+Laryngeal cancer is traditionally diagnosed using advanced clinical methods, which are both uncomfortable and inaccessible to patients with limited access to healthcare. Recently, using Machine Learning (ML) based methods to classify voice data has been considered a friendly and economically sustainable alternative for laryngeal cancer diagnosis. However, existing models often suffer from scarce training data, making them hard to train and validate in practice. To tackle this issue, we propose a custom open-source multi-modal deep learning architecture that addresses the issue of data scarcity. Our method uses a fine-tuned Wav2Vec 2.0 encoder to create rich audio representations, which are then combined with demographic/symptom data using a linear gating mechanism to minimize data ambiguity. Furthermore, we train a Variational Autoencoder (VAE) that creates reconstructed multimodal data to further improve the model's robustness to unseen data. Applying this architecture to the Far Eastern Memorial Hospital (FEMH) dataset, [ADD RESULTS TBD]
+
+
+### Usage
+This repository consists of the relevant data and code used to create this project. To run the experiments for yourself, use `inference.py` to test the model on a custom recording, and `train.py` to train/fine-tune a model. To run the Support Vector Machine (SVM) baseline, use `baseline.py` instead. Any hyperparameter tuning should be done in `config.py`. 
