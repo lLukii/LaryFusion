@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from transformers import Wav2Vec2Model
 from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
@@ -11,13 +12,6 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 from config import Config
 from dataset import load_wavs, batch_inputs, cross_validation
-from models import (
-    FusionModule,
-    Wav2VecBase,
-    AugmentedFusion,
-    ResNet, 
-    focal_loss
-)
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -25,8 +19,148 @@ warnings.filterwarnings("ignore")
 config = Config()
 torch.manual_seed(1337)
 
+class FusionModule(nn.Module):
+    """
+    Multimodal Fusion Model for Audio and Demographic Data
+    """
+    def __init__(self, config, num_features, hidden_dim=512, gate=False):
+        super().__init__()
+        self.demographic_enc = nn.Sequential(
+            nn.Linear(num_features, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
+        self.classifier = nn.Linear(2 * hidden_dim, 2)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * hidden_dim, 2 * hidden_dim), 
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(2 * hidden_dim, 2 * hidden_dim)
+        ) if gate else None
 
-def train_epoch(args, loader, model, optimizer):
+    def forward(self, audio, demographic):
+        z_A = self.aud_encoder(audio).extract_features
+        z_A = torch.mean(z_A, dim=1)
+        z_D = self.demographic_enc(demographic)
+        concat = torch.cat((z_A, z_D), dim=-1)
+        if self.gate: 
+            B = F.sigmoid(self.gate(concat)) # [B, 2 * dim]
+            concat = concat * B # [B, 2 * dim]
+
+        outputs = self.classifier(F.dropout(concat, p=0.1))
+        return outputs
+
+class Wav2VecBase(nn.Module):
+    """
+    Base classifier model using Wav2Vec2 for audio feature extraction.
+    Conv + Linear layer 
+    """
+    def __init__(self, config, output_dim=512):
+        super().__init__()
+        self.encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
+        self.classifier = nn.Linear(output_dim, 2)
+    
+    def forward(self, signals, demographics=None): 
+        encoded = self.encoder(signals).extract_features
+        encoded = torch.mean(encoded, dim=1)
+        encoded = self.classifier(F.dropout(encoded, p=0.1))
+        return encoded
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride = 1, downsample = None):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                            stride=stride, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU())
+        self.conv2 = nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 
+                            kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(out_channels))
+        self.downsample = downsample
+        self.relu = nn.ReLU()
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        if self.downsample:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+class ResNet(nn.Module):
+    """
+    ResNet-18 implementation for audio encoding.
+    Expects spectrogram input with dimension (B, 80, 188) 
+    """
+    def __init__(self, block=ResidualBlock, layers=[2, 2, 2, 2], hidden_dim=512):
+        super(ResNet, self).__init__()
+        self.inplanes = 64
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size = 7, stride = 2, padding = 3),
+            nn.BatchNorm2d(64),
+            nn.ReLU())
+        self.maxpool = nn.MaxPool2d(kernel_size = 3, stride = 2, padding = 1)
+        self.layer0 = self._make_layer(block, 64, layers[0], stride = 1)
+        self.layer1 = self._make_layer(block, 128, layers[1], stride = 2)
+        self.layer2 = self._make_layer(block, 256, layers[2], stride = 2)
+        self.layer3 = self._make_layer(block, 512, layers[3], stride = 2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 2)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes, kernel_size=1, stride=stride),
+                nn.BatchNorm2d(planes),
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x, demographics=None):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)  # (B, 80, 188) -> (B, 1, 80, 188)
+
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        x = self.layer0(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        x = self.classifier(F.dropout(x, p=0.1))
+
+        return x
+
+class FocalLoss(nn.Module): 
+    def __init__(self, gamma=2.0, alpha=0.969): 
+        self.gamma = gamma
+        self.alpha = alpha
+        
+    def forward(self, logits, labels):
+        ce = F.cross_entropy(logits, labels, reduction="none")
+        pt = torch.exp(-ce)
+        alpha_t = torch.where(labels == 1, self.alpha, 1 - self.alpha)
+        return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
+
+def train_epoch(loader, model, optimizer, loss_fn):
     model.train()
     total_loss, correct, total = 0, 0, 0
     for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
@@ -35,7 +169,7 @@ def train_epoch(args, loader, model, optimizer):
         labels = labels.to(config.device).long()
         optimizer.zero_grad()
         logits = model(signals, demographics)
-        loss = focal_loss(logits, labels)
+        loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
 
@@ -46,7 +180,7 @@ def train_epoch(args, loader, model, optimizer):
     return total_loss / len(loader), correct / total
 
 
-def eval_epoch(args, loader, model, loss_fn):
+def eval_epoch(loader, model, loss_fn):
     model.eval()
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels, all_probs = [], [], []
@@ -74,54 +208,6 @@ def eval_epoch(args, loader, model, loss_fn):
     auroc = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
     return total_loss / len(loader), correct / total, sensitivity, specificity, auroc, all_preds, all_labels
 
-def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, task_fn, consist_fn,
-                           alpha=0.5, w1=1e-4, w2=0.1, w3=0.1):
-    """
-    LeMDA training step (Liu et al., 2022)
-    """
-    model.train()
-    total_loss, correct, total = 0, 0, 0
-    for signals, demographics, labels in tqdm(loader, desc="Train (LeMDA)", leave=False):
-        signals = signals.to(config.device)
-        demographics = demographics.to(config.device)
-        labels = labels.to(config.device).long()
-
-        # Task Network update
-        model.freeze_grad(generate=False)
-        task_optimizer.zero_grad()
-        output, r_output, _, _ = model(signals, demographics, reconstruct=True)
-        loss_task = task_fn(output, labels) + task_fn(r_output, labels)
-        loss_task.backward()
-        task_optimizer.step()
-
-        # Augmentation Network update
-        model.freeze_grad(generate=True)
-        aug_optimizer.zero_grad()
-        output_g, r_output_g, mu, std = model(signals, demographics, reconstruct=True)
-
-        with torch.no_grad(): # only 
-            confident = F.softmax(output_g, dim=-1).amax(dim=-1) > alpha
-
-        adv_loss = task_fn(r_output_g, labels)
-        if confident.any():
-            log_p_aug = F.log_softmax(r_output_g[confident], dim=-1)
-            p_orig = F.softmax(output_g[confident], dim=-1).detach()
-            consist_loss = consist_fn(log_p_aug, p_orig)
-        else:
-            consist_loss = torch.zeros((), device=config.device)
-        kl_loss = model.generator.kl_loss(mu, std)
-
-        loss_aug = -w1 * adv_loss + w2 * consist_loss + w3 * kl_loss
-        loss_aug.backward()
-        aug_optimizer.step()
-
-        model.freeze_grad(generate=False)  # leave task net trainable/unfrozen by default
-
-        total_loss += loss_task.item()
-        correct += (output.argmax(dim=-1) == labels).sum().item()
-        total += len(labels)
-
-    return total_loss / len(loader), correct / total
 
 def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="results"):
     epochs = range(1, len(train_losses) + 1)
@@ -175,18 +261,9 @@ def main():
         model = Wav2VecBase(config).to(config.device)
     elif args.model_type == 3: 
         model = ResNet().to(config.device)
-    elif args.model_type == 4:
-        model = AugmentedFusion(config, num_features=dinput_dim).to(config.device)
-
-    loss_fn, gen_fn = nn.CrossEntropyLoss(), nn.KLDivLoss(reduction="batchmean")
-
-    aug_optimizer = None
-    if args.model_type == 4:
-        task_params = [p for n, p in model.named_parameters() if not n.startswith("generator.")]
-        optimizer = torch.optim.Adam(task_params, lr=config.lr)
-        aug_optimizer = torch.optim.Adam(model.generator.parameters(), lr=config.aug_lr)
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    
+    loss_fn = FocalLoss().to(config.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
@@ -197,8 +274,8 @@ def main():
     best_auroc = 0
     no_improv = 0
     for epoch in range(1, config.num_epochs + 1):
-        tr_loss, tr_acc = train_epoch(args, train_loader, model, optimizer)
-        val_loss, val_acc, val_sens, val_spec, val_auroc, preds, labels = eval_epoch(args, test_loader, model, loss_fn)
+        tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
+        val_loss, val_acc, val_sens, val_spec, val_auroc, preds, labels = eval_epoch(test_loader, model, loss_fn)
 
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
