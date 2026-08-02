@@ -9,7 +9,7 @@ from argparse import ArgumentParser
 import dataset as dataset_module
 from dataset import load_wavs, batch_inputs
 from config import Config
-from models import MultimodalFusion
+from laryfusion import MultimodalFusion
 
 
 CLASS_NAMES = ["benign/normal", "malignant"]

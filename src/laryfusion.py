@@ -1,120 +1,85 @@
+"""
+LaryFusion: the gated wav2vec2 + demographic fusion model, trained with a
+LeMDA-style (Liu et al., 2022) feature-space augmentation network.
+
+A VAE (`VAE`) learns to generate adversarial-but-label-preserving latent
+vectors for the fused audio + demographic embedding. Each training step
+(`train_augmented_epoch`) alternates between: (1) updating the task network
+(encoders + classifier) on real and VAE-reconstructed features, and (2)
+updating the VAE to maximize task loss on its reconstructions while a
+consistency regularizer keeps its output distribution close to the original,
+label-preserving prediction (see `AugmentedFusion.freeze_grad` for how the two
+networks are alternately frozen). Run this file directly to train the model
+end to end.
+
+Example: `python laryfusion.py --name laryfusion_v1`
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from transformers import Wav2Vec2Model
+from tqdm import tqdm
+from config import Config
+from dataset import load_wavs, batch_inputs, cross_validation
 from argparse import ArgumentParser
-import math
 from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
     roc_auc_score
 )
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from tqdm import tqdm
-from config import Config
-from transformers import Wav2Vec2Model
-from dataset import load_wavs, batch_inputs, cross_validation
 
 config = Config()
 
-class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim):
+class VAE(nn.Module):
+    '''
+    Variational autoencoder implementation for generating latent samples
+    '''
+    def __init__(self, input_dim=1024, hidden_dim=512, latent_dim=8):
         super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        half = self.dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / (half - 1))
-        args = t.float()[:, None] * freqs[None]
-        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
-
-class UNet1D(nn.Module):
-    """
-    Time-conditioned residual MLP noise predictor eps_theta(x_t, t) for flat
-    (B, dim) embeddings. Named UNet1D to keep the "denoiser" role explicit, but
-    a single 1024-d vector has no spatial structure for convs to exploit, so
-    this is a small conditioned MLP with residual blocks instead.
-    """
-    def __init__(self, dim=1024, hidden_dim=512, time_dim=128):
-        super().__init__()
-        self.time_mlp = nn.Sequential(
-            SinusoidalTimeEmbedding(time_dim),
-            nn.Linear(time_dim, time_dim),
-            nn.SiLU(),
-            nn.Linear(time_dim, time_dim),
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
         )
-        self.in_proj = nn.Linear(dim, hidden_dim)
-        self.block1 = nn.Sequential(nn.Linear(hidden_dim + time_dim, hidden_dim), nn.SiLU())
-        self.block2 = nn.Sequential(nn.Linear(hidden_dim + time_dim, hidden_dim), nn.SiLU())
-        self.out_proj = nn.Linear(hidden_dim, dim)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_std = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, x, t):
-        t_emb = self.time_mlp(t)
-        h = self.in_proj(x)
-        h = self.block1(torch.cat([h, t_emb], dim=-1)) + h
-        h = self.block2(torch.cat([h, t_emb], dim=-1)) + h
-        return self.out_proj(h)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, input_dim)
+        )
 
+    def encode(self, x):
+        h = self.encoder(x)
+        mu = self.fc_mu(h)
+        # Softplus + epsilon for stable std deviation
+        std = F.softplus(self.fc_std(h)) + 1e-6
+        return mu, std
 
-class DDPM(nn.Module):
-    """
-    Minimal DDPM (Ho et al., 2020) over flat feature vectors, standing in for
-    the VAE as LeMDA's augmentation network G. `augment()` noises a real
-    embedding to a random step t and recovers a one-step estimate of x0 from
-    the predicted noise
-    """
-    def __init__(self, input_dim=1024, hidden_dim=512, time_dim=128,
-                 timesteps=200, beta_start=1e-4, beta_end=2e-2):
-        super().__init__()
-        self.timesteps = timesteps
-        self.denoiser = UNet1D(dim=input_dim, hidden_dim=hidden_dim, time_dim=time_dim)
+    def reparameterize(self, mu, std):
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
-        betas = torch.linspace(beta_start, beta_end, timesteps)
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bars", alpha_bars)
+    def decode(self, z):
+        return self.decoder(z)
 
-    def q_sample(self, x0, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x0)
-        sqrt_ab = self.alpha_bars[t].sqrt().unsqueeze(-1)
-        sqrt_1m_ab = (1 - self.alpha_bars[t]).sqrt().unsqueeze(-1)
-        return sqrt_ab * x0 + sqrt_1m_ab * noise, noise
+    def forward(self, x, kl_weight=1.0):
+        mu, std = self.encode(x)
+        z = self.reparameterize(mu, std)
+        x_recon = self.decode(z)
+        return x_recon
 
-    def augment(self, x0, t=None):
-        """One-step differentiable noise -> predict -> reconstruct x0_hat."""
-        b = x0.size(0)
-        if t is None:
-            t = torch.randint(0, self.timesteps, (b,), device=x0.device)
-        x_t, noise = self.q_sample(x0, t)
-        pred_noise = self.denoiser(x_t, t)
-
-        sqrt_ab = self.alpha_bars[t].sqrt().unsqueeze(-1)
-        sqrt_1m_ab = (1 - self.alpha_bars[t]).sqrt().unsqueeze(-1)
-        x0_hat = (x_t - sqrt_1m_ab * pred_noise) / sqrt_ab
-        return x0_hat, pred_noise, noise
-
-    @torch.no_grad()
-    def generate(self, x0, start_frac=0.3):
-        """Optional full reverse-diffusion sampling (SDEdit-style partial noising)."""
-        b = x0.size(0)
-        start_t = max(1, int(self.timesteps * start_frac))
-        t0 = torch.full((b,), start_t - 1, device=x0.device, dtype=torch.long)
-        x_t, _ = self.q_sample(x0, t0)
-
-        for step in reversed(range(start_t)):
-            t = torch.full((b,), step, device=x0.device, dtype=torch.long)
-            pred_noise = self.denoiser(x_t, t)
-            alpha_t = self.alphas[t].unsqueeze(-1)
-            alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)
-            beta_t = self.betas[t].unsqueeze(-1)
-
-            mean = (x_t - beta_t / (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_t.sqrt()
-            noise = torch.randn_like(x_t) if step > 0 else torch.zeros_like(x_t)
-            x_t = mean + beta_t.sqrt() * noise
-        return x_t
+    def kl_loss(self, mu, std):
+        """KL divergence of N(mu, std^2) against the standard normal prior."""
+        var = std.pow(2)
+        kl = -0.5 * torch.sum(1 + torch.log(var + 1e-8) - mu.pow(2) - var, dim=-1)
+        return kl.mean()
 
 
 class AugmentedFusion(nn.Module):
@@ -138,7 +103,7 @@ class AugmentedFusion(nn.Module):
             nn.Dropout(p=0.1),
             nn.Linear(2 * hidden_dim, 2 * hidden_dim)
         ) 
-        self.generator = DDPM(input_dim=2 * hidden_dim)
+        self.generator = VAE(input_dim=2 * hidden_dim)
 
     def forward(self, audio, demographic, reconstruct=False):
         z_A = self.aud_encoder(audio).extract_features
@@ -152,9 +117,11 @@ class AugmentedFusion(nn.Module):
         output = self.classifier(F.dropout(concat, p=0.1))
         # Reconstruction only necessary for training. Just pass in data during inference.
         if reconstruct:
-            recon, pred_noise, noise = self.generator.augment(concat)
+            mu, std = self.generator.encode(concat)
+            z_aug = self.generator.reparameterize(mu, std)
+            recon = self.generator.decode(z_aug)
             r_output = self.classifier(F.dropout(recon, p=0.1))
-            return output, r_output, pred_noise, noise
+            return output, r_output, mu, std
 
         return output
 
@@ -164,7 +131,7 @@ class AugmentedFusion(nn.Module):
         generate=True  -> train the VAE generator, freeze the task network.
         """
         for module in self.children():
-            requires_grad = generate if isinstance(module, DDPM) else not generate
+            requires_grad = generate if isinstance(module, VAE) else not generate
             for p in module.parameters():
                 p.requires_grad = requires_grad
 
@@ -180,6 +147,7 @@ class FocalLoss(nn.Module):
         return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
 
 def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, task_fn, consist_fn,
+                           alpha=0.5, w1=1e-4, w2=0.1, w3=0.1):
     """
     LeMDA training step (Liu et al., 2022)
     """
@@ -201,9 +169,10 @@ def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, ta
         # Augmentation Network update
         model.freeze_grad(generate=True)
         aug_optimizer.zero_grad()
-        output_g, r_output_g, pred_noise, noise = model(signals, demographics, reconstruct=True)
+        output_g, r_output_g, mu, std = model(signals, demographics, reconstruct=True)
 
-        with torch.no_grad(): # only
+        # confidence masking, as mentioned in the paper to avoid the model learning from low-confidence predictions
+        with torch.no_grad(): 
             confident = F.softmax(output_g, dim=-1).amax(dim=-1) > alpha
 
         adv_loss = task_fn(r_output_g, labels)
@@ -213,9 +182,9 @@ def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, ta
             consist_loss = consist_fn(log_p_aug, p_orig)
         else:
             consist_loss = torch.zeros((), device=config.device)
-        diffusion_loss = F.mse_loss(pred_noise, noise)
+        kl_loss = model.generator.kl_loss(mu, std)
 
-        loss_aug = -w1 * adv_loss + w2 * consist_loss + w3 * diffusion_loss
+        loss_aug = -w1 * adv_loss + w2 * consist_loss + w3 * kl_loss
         loss_aug.backward()
         aug_optimizer.step()
 

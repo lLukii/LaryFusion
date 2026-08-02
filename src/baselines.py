@@ -1,3 +1,16 @@
+"""
+Baseline models and training script for throat cancer classification, without
+LeMDA-style feature-space augmentation (see laryfusion.py for that).
+
+Run directly to train one of four baselines, selected with `--model_type`:
+    0 - FusionModule (wav2vec2 + demographic FFN, concatenated)
+    1 - FusionModule with a sigmoid gate over the fused features
+    2 - Wav2VecBase (audio-only wav2vec2 classifier)
+    3 - ResNet-18 over mel-spectrograms (audio-only, no demographics)
+
+Example: `python baselines.py --name fusion_gated --model_type 1`
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,8 +67,8 @@ class FusionModule(nn.Module):
 
 class Wav2VecBase(nn.Module):
     """
-    Base classifier model using Wav2Vec2 for audio feature extraction.
-    Conv + Linear layer 
+    Audio-only classifier: wav2vec2 features mean-pooled over time, then a
+    single linear classifier head. No demographic input.
     """
     def __init__(self, config, output_dim=512):
         super().__init__()
@@ -70,6 +83,7 @@ class Wav2VecBase(nn.Module):
 
 
 class ResidualBlock(nn.Module):
+    """Standard ResNet basic block: two 3x3 convs with a skip connection."""
     def __init__(self, in_channels, out_channels, stride = 1, downsample = None):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Sequential(
@@ -149,11 +163,16 @@ class ResNet(nn.Module):
 
         return x
 
-class FocalLoss(nn.Module): 
-    def __init__(self, gamma=2.0, alpha=0.969): 
+class FocalLoss(nn.Module):
+    """
+    Focal loss (Lin et al., 2017) for the class-imbalanced benign/normal vs.
+    malignant split: down-weights easy, well-classified examples (via
+    `(1-pt)**gamma`) and reweights classes by `alpha`/`1-alpha`.
+    """
+    def __init__(self, gamma=2.0, alpha=0.969):
         self.gamma = gamma
         self.alpha = alpha
-        
+
     def forward(self, logits, labels):
         ce = F.cross_entropy(logits, labels, reduction="none")
         pt = torch.exp(-ce)
@@ -161,6 +180,7 @@ class FocalLoss(nn.Module):
         return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
 
 def train_epoch(loader, model, optimizer, loss_fn):
+    """Run one training pass over `loader`, returning (avg_loss, accuracy)."""
     model.train()
     total_loss, correct, total = 0, 0, 0
     for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
@@ -181,6 +201,12 @@ def train_epoch(loader, model, optimizer, loss_fn):
 
 
 def eval_epoch(loader, model, loss_fn):
+    """
+    Run one no-grad evaluation pass over `loader`.
+
+    Returns:
+        (avg_loss, accuracy, sensitivity, specificity, auroc, preds, labels)
+    """
     model.eval()
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels, all_probs = [], [], []
@@ -210,6 +236,7 @@ def eval_epoch(loader, model, loss_fn):
 
 
 def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="results"):
+    """Plot loss/accuracy curves and a confusion matrix, saved to `graphs/{file_name}.png`."""
     epochs = range(1, len(train_losses) + 1)
     _, axes = plt.subplots(1, 3, figsize=(16, 4))
 
@@ -244,7 +271,13 @@ def parse_args():
     parser.add_argument("--results_name", type=str, default="results", help="What to name the result diagram")
     return parser.parse_args()
 
-def main(): 
+def main():
+    """
+    Train one of the four baseline models (picked via `--model_type`, see
+    module docstring) and checkpoint the best epoch by validation AUROC to
+    `checkpoints/{name}_best.pt`, with early stopping after `config.patience`
+    epochs of no improvement.
+    """
     args = parse_args()
     dataset = load_wavs(include_demographics=True, as_spectrogram=args.model_type==3)
     train_data, test_data = cross_validation(dataset)

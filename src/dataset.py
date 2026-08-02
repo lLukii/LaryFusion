@@ -1,3 +1,16 @@
+"""
+Data loading pipeline shared by every training/inference script.
+
+Raw .wav recordings live under `config.dataset_path/{benign,malignant,normal}/`,
+alongside a `medicalhistory.xlsx` per class holding demographic/symptom features.
+`load_wavs` reads and pads/truncates each recording, then feature-extracts it
+either into a wav2vec2 input tensor (default) or a mel-spectrogram (for the
+ResNet-18 baseline). `cross_validation` splits patients into train/test and
+z-score normalizes demographic columns using train-split statistics only.
+`batch_inputs` wraps a split in a DataLoader, optionally oversampling the
+minority class to counter the benign/malignant/normal imbalance.
+"""
+
 from config import Config
 import librosa
 import os
@@ -24,7 +37,20 @@ spec_args = {
     'normalized': True
 }
 
-def load_wavs(include_demographics=False, as_spectrogram=False): 
+def load_wavs(include_demographics=False, as_spectrogram=False):
+    """
+    Load and feature-extract every .wav under each class folder in
+    `config.dataset_path`, keyed by patient/sample ID.
+
+    Args:
+        include_demographics: also attach each patient's background/symptom
+            row (read from `medicalhistory.xlsx`) under the "background" key.
+        as_spectrogram: extract a mel-spectrogram (for ResNet) instead of the
+            default wav2vec2 feature-extractor input.
+
+    Returns:
+        dict mapping patient ID -> {"signal", "label", "background"}.
+    """
     patients = {}
     feature_extractor = T.MelSpectrogram(**spec_args) if \
         as_spectrogram else Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
@@ -61,6 +87,11 @@ def load_wavs(include_demographics=False, as_spectrogram=False):
     return patients
 
 def cross_validation(dataset):
+    """
+    Split a `load_wavs` dataset into train/test patient lists and z-score
+    normalize non-binary demographic columns, fitting the scaler on the
+    train split only to avoid test-set leakage.
+    """
     patient_list = list(dataset.values())
     train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
 
@@ -83,6 +114,7 @@ def cross_validation(dataset):
     return train_data, test_data
 
 class ThroatCancerDataset(Dataset):
+    """Thin `torch.utils.data.Dataset` wrapper around a `cross_validation` split."""
     def __init__(self, data, labels):
         self.data = data
         self.labels = labels
@@ -99,12 +131,22 @@ class ThroatCancerDataset(Dataset):
 
 
 def collate_fn(batch):
+    """Stack a list of (signal, demographics, label) samples into batch tensors."""
     signals, demos, labels = zip(*batch)
     demographics = torch.stack(demos) if demos[0] is not None else None
-    return torch.stack(signals), demographics, torch.stack(list(labels)), 
+    return torch.stack(signals), demographics, torch.stack(list(labels)),
 
 
 def batch_inputs(data, oversample=False, shuffle=False):
+    """
+    Wrap a patient list (from `cross_validation`) in a DataLoader.
+
+    Args:
+        oversample: use a `WeightedRandomSampler` (inverse class frequency) to
+            counter class imbalance; only takes effect when `shuffle=True`.
+        shuffle: whether to shuffle/sample the data (typically True for train,
+            False for eval).
+    """
     labels = torch.tensor([patient["label"] for patient in data])
     sampler = None
     if oversample:
