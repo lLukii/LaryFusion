@@ -15,15 +15,25 @@ end to end.
 Example: `python laryfusion.py --name laryfusion_v1`
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from transformers import Wav2Vec2Model
+from torch.utils.data import Dataset, DataLoader
+from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor
+
+from librosa import load
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
 from config import Config
 from dataset import load_wavs, batch_inputs, cross_validation
 from argparse import ArgumentParser
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
@@ -31,6 +41,90 @@ from sklearn.metrics import (
 )
 
 config = Config()
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
+
+def load_wavs(include_demographics=False): 
+    patients = {}
+    for voice_type in ["benign", "malignant", "normal"]:
+        for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
+            if sample.split(".")[-1] != "wav":
+                continue
+            user_id = sample.split(".")[0]
+            signal, _ = load(os.path.join(config.dataset_path, voice_type, sample), sr=config.sampling_rate)
+            if len(signal) < config.padding: 
+                signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant", constant_values=0)
+            else: 
+                signal = signal[:config.padding]
+            
+            processed = feature_extractor(signal, sampling_rate=config.sampling_rate,  
+                return_tensors="pt")
+            signal = processed.input_values
+            patients[user_id] = {
+                    "signal" : signal,
+                    "label" : 1 if voice_type in ["malignant", "synthetic"] else 0,
+                    "background" : None
+            }
+    
+    if include_demographics:
+        benign_history = pd.read_excel(os.path.join(config.dataset_path, "benign", "medicalhistory.xlsx")).fillna(0)
+        malignant_history = pd.read_excel(os.path.join(config.dataset_path, "malignant", "medicalhistory.xlsx")).fillna(0)
+        normal_history = pd.read_excel(os.path.join(config.dataset_path, "normal", "medicalhistory.xlsx")).fillna(0)
+
+        for medical_history in [benign_history, malignant_history, normal_history]:
+            for _, row in medical_history.iterrows():
+                user_id = row["ID"]
+                patients[user_id]["background"] = row.drop(["ID", "Disease category"])
+
+    return patients
+
+def cross_validation(dataset):
+    patient_list = list(dataset.values())
+    train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
+
+    # normalize demographic features based on statistics in each split
+    if train_data[0]["background"] is not None:
+        bg_cols = train_data[0]["background"].index
+        quant_cols = [col for col in bg_cols
+                      if pd.Series([p["background"][col] for p in train_data]).nunique() > 2] 
+        # only normalize non-binary rows
+
+        train_bg = pd.DataFrame([p["background"] for p in train_data])
+        scaler = StandardScaler()
+        scaler.fit(train_bg[quant_cols])
+
+        for split in [train_data, test_data]:
+            for p in split:
+                bg = p["background"].copy()
+                bg[quant_cols] = scaler.transform(bg[quant_cols].values.reshape(1, -1).astype(float))[0]
+                p["background"] = bg
+
+    return train_data, test_data
+
+class ThroatCancerDataset(Dataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        p = self.data[idx]
+        demo = (torch.tensor(p["background"].values.astype(float), dtype=torch.float32)
+                if p["background"] is not None else None)
+        return p["signal"].squeeze(0), demo, self.labels[idx]
+
+
+def collate_fn(batch):
+    signals, demos, labels = zip(*batch)
+    demographics = torch.stack(demos) if demos[0] is not None else None
+    return torch.stack(signals), demographics, torch.stack(list(labels))
+
+def batch_inputs(data, shuffle=False):
+    labels = torch.tensor([patient["label"] for patient in data])
+    return DataLoader(ThroatCancerDataset(data, labels),
+                      batch_size=config.batch_size, shuffle=shuffle
+                      collate_fn=collate_fn)
 
 class VAE(nn.Module):
     '''
