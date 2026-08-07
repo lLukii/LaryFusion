@@ -1,8 +1,5 @@
 """
-1D-CNN baseline for throat cancer classification, adapted from Kim et al.,
-"Convolutional Neural Network Classifies Pathological Voice Change in
-Laryngeal Cancer with High Accuracy", J. Clin. Med. 2020, 9(11):3415
-(https://doi.org/10.3390/jcm9113415).
+1D-CNN baseline for throat cancer classification, adapted from Kim et al., https://doi.org/10.3390/jcm9113415.
 
 Operates directly on the raw waveform (no hand-crafted features). Six
 convolution blocks with channel counts 16/32/64/128/256/256 (matching the
