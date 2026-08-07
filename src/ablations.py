@@ -18,7 +18,6 @@ from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor
 
 import numpy as np
 import pandas as pd
-import os
 from sklearn.model_selection import train_test_split
 from librosa import load
 from sklearn.preprocessing import StandardScaler
@@ -26,7 +25,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
-    roc_auc_score
+    average_precision_score
 )
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -41,12 +40,10 @@ feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
 def load_wavs(include_demographics=False): 
     patients = {}
     for voice_type in ["benign", "malignant", "normal"]:
-        for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
-            if sample.split(".")[-1] != "wav":
-                continue
-            user_id = sample.split(".")[0]
-            signal, _ = load(os.path.join(config.dataset_path, voice_type, sample), sr=config.sampling_rate)
-            if len(signal) < config.padding: 
+        for wav_path in (config.dataset_path / voice_type).glob("*.wav"):
+            user_id = wav_path.stem
+            signal, _ = load(wav_path, sr=config.sampling_rate)
+            if len(signal) < config.padding:
                 signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant", constant_values=0)
             else: 
                 signal = signal[:config.padding]
@@ -61,9 +58,9 @@ def load_wavs(include_demographics=False):
             }
     
     if include_demographics:
-        benign_history = pd.read_excel(os.path.join(config.dataset_path, "benign", "medicalhistory.xlsx")).fillna(0)
-        malignant_history = pd.read_excel(os.path.join(config.dataset_path, "malignant", "medicalhistory.xlsx")).fillna(0)
-        normal_history = pd.read_excel(os.path.join(config.dataset_path, "normal", "medicalhistory.xlsx")).fillna(0)
+        benign_history = pd.read_excel(config.dataset_path / "benign" / "medicalhistory.xlsx").fillna(0)
+        malignant_history = pd.read_excel(config.dataset_path / "malignant" / "medicalhistory.xlsx").fillna(0)
+        normal_history = pd.read_excel(config.dataset_path / "normal" / "medicalhistory.xlsx").fillna(0)
 
         for medical_history in [benign_history, malignant_history, normal_history]:
             for _, row in medical_history.iterrows():
@@ -215,7 +212,7 @@ def eval_epoch(loader, model, loss_fn):
     Run one no-grad evaluation pass over `loader`.
 
     Returns:
-        (avg_loss, accuracy, sensitivity, specificity, auroc, preds, labels)
+        (avg_loss, accuracy, sensitivity, specificity, auprc, preds, labels)
     """
     model.eval()
     total_loss, correct, total = 0, 0, 0
@@ -241,8 +238,8 @@ def eval_epoch(loader, model, loss_fn):
     tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    auroc = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
-    return total_loss / len(loader), correct / total, sensitivity, specificity, auroc, all_preds, all_labels
+    auprc = average_precision_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
+    return total_loss / len(loader), correct / total, sensitivity, specificity, auprc, all_preds, all_labels
 
 
 def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="results"):
@@ -283,7 +280,7 @@ def parse_args():
 def main():
     """
     Train one of the four baseline models (picked via `--model_type`, see
-    module docstring) and checkpoint the best epoch by validation AUROC to
+    module docstring) and checkpoint the best epoch by validation AUPRC to
     `checkpoints/{name}_best.pt`, with early stopping after `config.patience`
     epochs of no improvement.
     """
@@ -315,7 +312,7 @@ def main():
     no_improv = 0
     for epoch in range(1, config.num_epochs + 1):
         tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
-        val_loss, val_acc, val_sens, val_spec, val_auroc, preds, labels = eval_epoch(test_loader, model, loss_fn)
+        val_loss, val_acc, val_sens, val_spec, val_auprc, preds, labels = eval_epoch(test_loader, model, loss_fn)
 
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
@@ -324,7 +321,7 @@ def main():
 
         print(f"Epoch {epoch:02d} | "
             f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auroc: {val_auroc:.3f}")
+            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auprc: {val_auprc:.3f}")
 
         if val_loss < best_test_loss:
             print("Updating best model...")

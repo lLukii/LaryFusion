@@ -15,7 +15,6 @@ Run from `src/`:
     python cnn1d.py --name cnn1d_v1
 """
 
-import os
 import numpy as np
 import librosa
 import torch
@@ -45,12 +44,10 @@ def load_patients():
     """
     patients = {}
     for voice_type in ["benign", "malignant", "normal"]:
-        folder = os.path.join(config.dataset_path, voice_type)
-        for sample in os.listdir(folder):
-            if sample.split(".")[-1] != "wav":
-                continue
-            user_id = sample.split(".")[0]
-            signal, _ = librosa.load(os.path.join(folder, sample), sr=config.sampling_rate)
+        folder = config.dataset_path / voice_type
+        for wav_path in folder.glob("*.wav"):
+            user_id = wav_path.stem
+            signal, _ = librosa.load(wav_path, sr=config.sampling_rate)
             if len(signal) < config.padding:
                 signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant")
             else:

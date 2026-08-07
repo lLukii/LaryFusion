@@ -1,5 +1,6 @@
 import torch
 from dataclasses import dataclass
+from pathlib import Path
 
 @dataclass
 class Config:
@@ -16,7 +17,7 @@ class Config:
     num_epochs: int = 15
     patience: int = 5
     batch_size: int = 64
-    dataset_path: str = "/Users/llukii/Desktop/School/Programming/Multimodal throat cancer/dataset"
+    dataset_path: Path = Path("/Users/llukii/Desktop/School/Programming/Multimodal throat cancer/dataset")
     model_path: str = ""
     w2v_name: str = "facebook/wav2vec2-base"
     pretrained: bool = True

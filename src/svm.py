@@ -21,7 +21,6 @@ Run from `src/`:
     python svm.py
 """
 
-import os
 import numpy as np
 import pandas as pd
 import parselmouth
@@ -81,19 +80,17 @@ def load_patients():
     """
     patients = {}
     for voice_type in ["benign", "malignant", "normal"]:
-        folder = os.path.join(config.dataset_path, voice_type)
-        for sample in os.listdir(folder):
-            if sample.split(".")[-1] != "wav":
-                continue
-            user_id = sample.split(".")[0]
-            sound = parselmouth.Sound(os.path.join(folder, sample))
+        folder = config.dataset_path / voice_type
+        for wav_path in folder.glob("*.wav"):
+            user_id = wav_path.stem
+            sound = parselmouth.Sound(str(wav_path))
             patients[user_id] = {
                 "acoustic": extract_acoustic_features(sound),
                 "label": 1 if voice_type == "malignant" else 0,
                 "age": None,
             }
 
-        history = pd.read_excel(os.path.join(folder, "medicalhistory.xlsx")).fillna(0)
+        history = pd.read_excel(folder / "medicalhistory.xlsx").fillna(0)
         for _, row in history.iterrows():
             patients[row["ID"]]["age"] = float(row["Age"])
 

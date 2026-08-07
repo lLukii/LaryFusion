@@ -25,7 +25,6 @@ Run from `src/`:
     python logisticreg.py
 """
 
-import os
 import numpy as np
 import pandas as pd
 import librosa
@@ -67,12 +66,10 @@ def load_patients():
     """
     patients = {}
     for voice_type in ["benign", "malignant", "normal"]:
-        folder = os.path.join(config.dataset_path, voice_type)
-        for sample in os.listdir(folder):
-            if sample.split(".")[-1] != "wav":
-                continue
-            user_id = sample.split(".")[0]
-            signal, _ = librosa.load(os.path.join(folder, sample), sr=config.sampling_rate)
+        folder = config.dataset_path / voice_type
+        for wav_path in folder.glob("*.wav"):
+            user_id = wav_path.stem
+            signal, _ = librosa.load(wav_path, sr=config.sampling_rate)
             functionals = smile.process_signal(signal, config.sampling_rate)
             patients[user_id] = {
                 "audio": functionals.values.flatten(),
@@ -80,7 +77,7 @@ def load_patients():
                 "background": None,
             }
 
-        history = pd.read_excel(os.path.join(folder, "medicalhistory.xlsx")).fillna(0)
+        history = pd.read_excel(folder / "medicalhistory.xlsx").fillna(0)
         for _, row in history.iterrows():
             patients[row["ID"]]["background"] = row.drop(["ID", "Disease category"])
 

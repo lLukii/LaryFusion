@@ -15,8 +15,6 @@ end to end.
 Example: `python laryfusion.py --name laryfusion_v1`
 """
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,12 +47,10 @@ feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
 def load_wavs(include_demographics=False): 
     patients = {}
     for voice_type in ["benign", "malignant", "normal"]:
-        for sample in os.listdir(os.path.join(config.dataset_path, voice_type)):
-            if sample.split(".")[-1] != "wav":
-                continue
-            user_id = sample.split(".")[0]
-            signal, _ = load(os.path.join(config.dataset_path, voice_type, sample), sr=config.sampling_rate)
-            if len(signal) < config.padding: 
+        for wav_path in (config.dataset_path / voice_type).glob("*.wav"):
+            user_id = wav_path.stem
+            signal, _ = load(wav_path, sr=config.sampling_rate)
+            if len(signal) < config.padding:
                 signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant", constant_values=0)
             else: 
                 signal = signal[:config.padding]
@@ -69,9 +65,9 @@ def load_wavs(include_demographics=False):
             }
     
     if include_demographics:
-        benign_history = pd.read_excel(os.path.join(config.dataset_path, "benign", "medicalhistory.xlsx")).fillna(0)
-        malignant_history = pd.read_excel(os.path.join(config.dataset_path, "malignant", "medicalhistory.xlsx")).fillna(0)
-        normal_history = pd.read_excel(os.path.join(config.dataset_path, "normal", "medicalhistory.xlsx")).fillna(0)
+        benign_history = pd.read_excel(config.dataset_path / "benign" / "medicalhistory.xlsx").fillna(0)
+        malignant_history = pd.read_excel(config.dataset_path / "malignant" / "medicalhistory.xlsx").fillna(0)
+        normal_history = pd.read_excel(config.dataset_path / "normal" / "medicalhistory.xlsx").fillna(0)
 
         for medical_history in [benign_history, malignant_history, normal_history]:
             for _, row in medical_history.iterrows():
