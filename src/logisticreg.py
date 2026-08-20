@@ -26,9 +26,6 @@ Run from `src/`:
 """
 
 import numpy as np
-import pandas as pd
-import librosa
-import opensmile
 import matplotlib.pyplot as plt
 
 from argparse import ArgumentParser
@@ -36,82 +33,24 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import (
     confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
 )
 from sklearn.preprocessing import StandardScaler
 
 from config import Config
+from dataset import load_patients, cross_validation
 
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
 
-smile = opensmile.Smile(
-    feature_set=opensmile.FeatureSet.eGeMAPSv02,
-    feature_level=opensmile.FeatureLevel.Functionals,
-)
-
-
-def load_patients():
-    """
-    Load every .wav under `config.dataset_path/{benign,malignant,normal}`,
-    extract OpenSMILE eGeMAPSv02 functionals, and attach each patient's
-    demographic/symptom row from that class's `medicalhistory.xlsx`.
-
-    Returns:
-        dict mapping patient ID -> {"audio", "background", "label"}.
-    """
-    patients = {}
-    for voice_type in ["benign", "malignant", "normal"]:
-        folder = config.dataset_path / voice_type
-        for wav_path in folder.glob("*.wav"):
-            user_id = wav_path.stem
-            signal, _ = librosa.load(wav_path, sr=config.sampling_rate)
-            functionals = smile.process_signal(signal, config.sampling_rate)
-            patients[user_id] = {
-                "audio": functionals.values.flatten(),
-                "label": 1 if voice_type == "malignant" else 0,
-                "background": None,
-            }
-
-        history = pd.read_excel(folder / "medicalhistory.xlsx").fillna(0)
-        for _, row in history.iterrows():
-            patients[row["ID"]]["background"] = row.drop(["ID", "Disease category"])
-
-    return patients
-
-
-def cross_validation(patients):
-    """
-    Split patients into train/test and z-score normalize non-binary
-    demographic/symptom columns, fitting the scaler on the train split only
-    to avoid test-set leakage.
-    """
-    patient_list = list(patients.values())
-    train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
-
-    bg_cols = train_data[0]["background"].index
-    quant_cols = [col for col in bg_cols
-                  if pd.Series([p["background"][col] for p in train_data]).nunique() > 2]
-
-    train_bg = pd.DataFrame([p["background"] for p in train_data])
-    scaler = StandardScaler()
-    scaler.fit(train_bg[quant_cols])
-    for split in [train_data, test_data]:
-        for p in split:
-            bg = p["background"].copy()
-            bg[quant_cols] = scaler.transform(bg[quant_cols].values.reshape(1, -1).astype(float))[0]
-            p["background"] = bg
-
-    return train_data, test_data
-
 
 def build_matrices(data):
     """Stack per-patient audio feature vectors, demographic vectors, and labels."""
-    X_audio = np.stack([p["audio"] for p in data])
+    X_audio = np.stack([p["signal"] for p in data])
     X_demo = np.stack([p["background"].values.astype(float) for p in data])
     y = np.array([p["label"] for p in data])
     return X_audio, X_demo, y
@@ -139,7 +78,7 @@ def main():
     args = parse_args()
 
     print("Loading dataset and extracting OpenSMILE features...")
-    patients = load_patients()
+    patients = load_patients(feature_type="opensmile", include_demographics=True)
     train_data, test_data = cross_validation(patients)
 
     X_train_audio, X_train_demo, y_train = build_matrices(train_data)

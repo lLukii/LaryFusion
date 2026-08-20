@@ -15,8 +15,6 @@ Run from `src/`:
     python cnn1d.py --name cnn1d_v1
 """
 
-import numpy as np
-import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,50 +22,16 @@ import matplotlib.pyplot as plt
 
 from argparse import ArgumentParser
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
-from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, average_precision_score
 
 from config import Config
+from dataset import load_patients, cross_validation, batch_inputs
 
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
 torch.manual_seed(1337)
-
-
-def load_patients():
-    """
-    Load every .wav under `config.dataset_path/{benign,malignant,normal}`
-    as a raw waveform, zero-padded/truncated to `config.padding` samples.
-    """
-    patients = {}
-    for voice_type in ["benign", "malignant", "normal"]:
-        folder = config.dataset_path / voice_type
-        for wav_path in folder.glob("*.wav"):
-            user_id = wav_path.stem
-            signal, _ = librosa.load(wav_path, sr=config.sampling_rate)
-            if len(signal) < config.padding:
-                signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant")
-            else:
-                signal = signal[:config.padding]
-            patients[user_id] = {"signal": signal.astype(np.float32),
-                                  "label": 1 if voice_type == "malignant" else 0}
-    return patients
-
-
-class ThroatCancerAudioDataset(Dataset):
-    """Raw-waveform (signal, label) dataset for the 1D-CNN."""
-    def __init__(self, data):
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        p = self.data[idx]
-        return torch.from_numpy(p["signal"]), p["label"]
 
 
 class ConvBlock1D(nn.Module):
@@ -134,11 +98,11 @@ def train_epoch(loader, model, optimizer, loss_fn):
     """Run one training pass over `loader`, returning (avg_loss, accuracy)."""
     model.train()
     total_loss, correct, total = 0, 0, 0
-    for signals, labels in tqdm(loader, desc="Train", leave=False):
+    for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
         signals = signals.to(config.device)
         labels = labels.to(config.device).long()
         optimizer.zero_grad()
-        logits = model(signals)
+        logits = model(signals, demographics)
         loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
@@ -155,17 +119,17 @@ def eval_epoch(loader, model, loss_fn):
     Run one no-grad evaluation pass over `loader`.
 
     Returns:
-        (avg_loss, accuracy, sensitivity, specificity, auroc, preds, labels)
+        (avg_loss, accuracy, sensitivity, specificity, auprc, preds, labels)
     """
     model.eval()
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels, all_probs = [], [], []
     with torch.no_grad():
-        for signals, labels in tqdm(loader, desc="Eval", leave=False):
+        for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
             signals = signals.to(config.device)
             labels = labels.to(config.device).long()
 
-            logits = model(signals)
+            logits = model(signals, demographics)
             loss = loss_fn(logits, labels)
 
             total_loss += loss.item()
@@ -180,8 +144,8 @@ def eval_epoch(loader, model, loss_fn):
     tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    auroc = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
-    return total_loss / len(loader), correct / total, sensitivity, specificity, auroc, all_preds, all_labels
+    auprc = average_precision_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
+    return total_loss / len(loader), correct / total, sensitivity, specificity, auprc, all_preds, all_labels
 
 
 def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="cnn1d_results"):
@@ -221,19 +185,18 @@ def parse_args():
 
 def main():
     """
-    Train the 1D-CNN and checkpoint the best epoch by validation AUROC to
+    Train the 1D-CNN and checkpoint the best epoch by validation loss to
     `checkpoints/{name}_best.pt`, with early stopping after `config.patience`
     epochs of no improvement.
     """
     args = parse_args()
 
     print("Loading dataset...")
-    patients = load_patients()
-    patient_list = list(patients.values())
-    train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
+    patients = load_patients(feature_type="raw")
+    train_data, test_data = cross_validation(patients)
 
-    train_loader = DataLoader(ThroatCancerAudioDataset(train_data), batch_size=config.batch_size, shuffle=True)
-    test_loader = DataLoader(ThroatCancerAudioDataset(test_data), batch_size=config.batch_size)
+    train_loader = batch_inputs(train_data, stratify=True)
+    test_loader = batch_inputs(test_data)
 
     model = CNN1D().to(config.device)
     loss_fn = FocalLoss().to(config.device)
@@ -245,11 +208,11 @@ def main():
     print(f"Model layout: {model}")
     print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
-    best_auroc = 0
+    best_loss = float('inf')
     no_improv = 0
     for epoch in range(1, config.num_epochs + 1):
         tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
-        val_loss, val_acc, val_sens, val_spec, val_auroc, preds, labels = eval_epoch(test_loader, model, loss_fn)
+        val_loss, val_acc, val_sens, val_spec, val_auprc, preds, labels = eval_epoch(test_loader, model, loss_fn)
 
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
@@ -258,18 +221,18 @@ def main():
 
         print(f"Epoch {epoch:02d} | "
             f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auroc: {val_auroc:.3f}")
+            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auprc: {val_auprc:.3f}")
 
-        if val_auroc > best_auroc:
+        if val_loss < best_loss:
             print("Updating best model...")
-            best_auroc = val_auroc
+            best_loss = val_loss
             no_improv = 0
             torch.save(model.state_dict(), f"../checkpoints/{args.name}_best.pt")
             visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, args.results_name)
         else:
             no_improv += 1
             if no_improv >= config.patience:
-                print(f"No improvement in val auroc for {config.patience} epochs, stopping early.")
+                print(f"No improvement in val loss for {config.patience} epochs, stopping early.")
                 break
 
 

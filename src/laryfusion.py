@@ -1,298 +1,186 @@
 """
-LaryFusion: the gated wav2vec2 + demographic fusion model, trained with a
-LeMDA-style (Liu et al., 2022) feature-space augmentation network.
+LaryFusion: multimodal (audio + demographic) fusion classifier for throat
+cancer classification, regularized with modality dropout and evaluated via
+stratified k-fold cross-validation - simpler alternatives to the earlier
+LeMDA-VAE and two-stage contrastive approaches, chosen because this
+dataset's small malignant-class count made both of those noisy/overkill.
 
-A VAE (`VAE`) learns to generate adversarial-but-label-preserving latent
-vectors for the fused audio + demographic embedding. Each training step
-(`train_augmented_epoch`) alternates between: (1) updating the task network
-(encoders + classifier) on real and VAE-reconstructed features, and (2)
-updating the VAE to maximize task loss on its reconstructions while a
-consistency regularizer keeps its output distribution close to the original,
-label-preserving prediction (see `AugmentedFusion.freeze_grad` for how the two
-networks are alternately frozen). Run this file directly to train the model
-end to end.
+Modality dropout: during training, each modality's encoded features are
+independently zeroed with probability `p_drop` before fusion, so the
+classifier can't shortcut through whichever modality happens to be more
+predictive in-sample and is forced to use both.
 
-Example: `python laryfusion.py --name laryfusion_v1`
+Stratified k-fold: rather than a single train/test split, `n_splits` folds
+(`dataset.stratified_kfold`) are trained and evaluated independently and
+metrics are reported as mean +/- std across folds, which matters here since
+a single 80/20 split leaves only a handful of malignant validation examples
+and its point-estimate metrics carry a lot of split-dependent variance.
+
+Class-balanced loss: `FocalLoss`'s per-class weight is set via the
+Effective Number of Samples (Cui et al., 2019, arxiv.org/abs/1901.05555)
+rather than a hand-picked alpha - see the class docstring below.
+
+Run from `src/`:
+    python laryfusion.py --name laryfusion_v1
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor
 
-from librosa import load
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from config import Config
 from argparse import ArgumentParser
+from tqdm import tqdm
+from transformers import Wav2Vec2Model
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, average_precision_score, roc_auc_score
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-    average_precision_score
-)
+from config import Config
+from dataset import load_patients, stratified_kfold, batch_inputs
 
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.w2v_name)
-
-def load_wavs(include_demographics=False): 
-    patients = {}
-    for voice_type in ["benign", "malignant", "normal"]:
-        for wav_path in (config.dataset_path / voice_type).glob("*.wav"):
-            user_id = wav_path.stem
-            signal, _ = load(wav_path, sr=config.sampling_rate)
-            if len(signal) < config.padding:
-                signal = np.pad(signal, (0, config.padding - len(signal)), mode="constant", constant_values=0)
-            else: 
-                signal = signal[:config.padding]
-            
-            processed = feature_extractor(signal, sampling_rate=config.sampling_rate,  
-                return_tensors="pt")
-            signal = processed.input_values
-            patients[user_id] = {
-                    "signal" : signal,
-                    "label" : 1 if voice_type in ["malignant", "synthetic"] else 0,
-                    "background" : None
-            }
-    
-    if include_demographics:
-        benign_history = pd.read_excel(config.dataset_path / "benign" / "medicalhistory.xlsx").fillna(0)
-        malignant_history = pd.read_excel(config.dataset_path / "malignant" / "medicalhistory.xlsx").fillna(0)
-        normal_history = pd.read_excel(config.dataset_path / "normal" / "medicalhistory.xlsx").fillna(0)
-
-        for medical_history in [benign_history, malignant_history, normal_history]:
-            for _, row in medical_history.iterrows():
-                user_id = row["ID"]
-                patients[user_id]["background"] = row.drop(["ID", "Disease category"])
-
-    return patients
-
-def cross_validation(dataset):
-    patient_list = list(dataset.values())
-    train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
-
-    # normalize demographic features based on statistics in each split
-    if train_data[0]["background"] is not None:
-        bg_cols = train_data[0]["background"].index
-        quant_cols = [col for col in bg_cols
-                      if pd.Series([p["background"][col] for p in train_data]).nunique() > 2] 
-        # only normalize non-binary rows
-
-        train_bg = pd.DataFrame([p["background"] for p in train_data])
-        scaler = StandardScaler()
-        scaler.fit(train_bg[quant_cols])
-
-        for split in [train_data, test_data]:
-            for p in split:
-                bg = p["background"].copy()
-                bg[quant_cols] = scaler.transform(bg[quant_cols].values.reshape(1, -1).astype(float))[0]
-                p["background"] = bg
-
-    return train_data, test_data
-
-class ThroatCancerDataset(Dataset):
-    def __init__(self, data, labels):
-        self.data = data
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        p = self.data[idx]
-        demo = (torch.tensor(p["background"].values.astype(float), dtype=torch.float32)
-                if p["background"] is not None else None)
-        return p["signal"].squeeze(0), demo, self.labels[idx]
 
 
-def collate_fn(batch):
-    signals, demos, labels = zip(*batch)
-    demographics = torch.stack(demos) if demos[0] is not None else None
-    return torch.stack(signals), demographics, torch.stack(list(labels))
-
-def batch_inputs(data, shuffle=False):
-    labels = torch.tensor([patient["label"] for patient in data])
-    return DataLoader(ThroatCancerDataset(data, labels),
-                      batch_size=config.batch_size, shuffle=shuffle,
-                      collate_fn=collate_fn)
-
-class VAE(nn.Module):
-    '''
-    Variational autoencoder implementation for generating latent samples
-    '''
-    def __init__(self, input_dim=576, hidden_dim=288, latent_dim=8):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_std = nn.Linear(hidden_dim, latent_dim)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def encode(self, x):
-        h = self.encoder(x)
-        mu = self.fc_mu(h)
-        # Softplus + epsilon for stable std deviation
-        std = F.softplus(self.fc_std(h)) + 1e-6
-        return mu, std
-
-    def reparameterize(self, mu, std):
-        eps = torch.randn_like(std)
-        return mu + eps * std
- 
-    def decode(self, z):
-        return self.decoder(z)
-
-    def forward(self, x, kl_weight=1.0):
-        mu, std = self.encode(x)
-        z = self.reparameterize(mu, std)
-        x_recon = self.decode(z)
-        return x_recon
-
-    def kl_loss(self, mu, std):
-        """KL divergence of N(mu, std^2) against the standard normal prior."""
-        var = std.pow(2)
-        kl = -0.5 * torch.sum(1 + torch.log(var + 1e-8) - mu.pow(2) - var, dim=-1)
-        return kl.mean()
-
-
-class AugmentedFusion(nn.Module):
+class FusionModule(nn.Module):
     """
-    LeMDA-style feature-space augmentation: a VAE learns to generate adversarial
-    but label-preserving latent vectors for the fused audio + demographic features.
+    Audio (Wav2Vec2Model) + demographic (MLP) fusion classifier with
+    modality dropout (see module docstring) and an optional sigmoid gate
+    over the fused features, matching `ablations.py`'s `FusionModule`.
     """
-    def __init__(self, config, num_features, audio_dim=512, demo_dim=64, gate=False):
+    def __init__(self, config: Config, num_features: int, audio_dim: int = 512,
+                 demo_dim: int = 64, gate: bool = False, p_drop: float = 0.1):
         super().__init__()
         combined_dim = audio_dim + demo_dim
+        self.p_drop = p_drop
         self.demographic_enc = nn.Sequential(
             nn.Linear(num_features, demo_dim),
             nn.ReLU(),
             nn.Dropout(p=0.1),
-            nn.Linear(demo_dim, demo_dim)
+            nn.Linear(demo_dim, demo_dim),
         )
         self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
         self.classifier = nn.Linear(combined_dim, 2)
         self.gate = nn.Sequential(
-            nn.Linear(combined_dim, combined_dim), 
+            nn.Linear(combined_dim, combined_dim),
             nn.ReLU(),
             nn.Dropout(p=0.1),
-            nn.Linear(combined_dim, combined_dim)
+            nn.Linear(combined_dim, combined_dim),
         ) if gate else None
 
-        self.generator = VAE(input_dim=combined_dim, hidden_dim=combined_dim//2, latent_dim=8)
-
-    def forward(self, audio, demographic, reconstruct=False):
-        z_A = self.aud_encoder(audio).extract_features
-        z_A = torch.mean(z_A, dim=1)
+    def forward(self, audio: torch.Tensor, demographic: torch.Tensor) -> torch.Tensor:
+        z_A = self.aud_encoder(audio).extract_features.mean(dim=1)
         z_D = self.demographic_enc(demographic)
+
+        if self.training and self.p_drop > 0:
+            keep_a = (torch.rand(z_A.size(0), 1, device=z_A.device) >= self.p_drop).float()
+            keep_d = (torch.rand(z_D.size(0), 1, device=z_D.device) >= self.p_drop).float()
+            z_A = z_A * keep_a
+            z_D = z_D * keep_d
+
         concat = torch.cat((z_A, z_D), dim=-1)
         if self.gate:
-            B = F.sigmoid(self.gate(concat))
-            concat = concat * B
+            weights = torch.sigmoid(self.gate(concat))
+            concat = concat * weights
 
-        output = self.classifier(F.dropout(concat, p=0.1))
-        # Reconstruction only necessary for training. Just pass in data during inference.
-        if reconstruct:
-            mu, std = self.generator.encode(concat)
-            z_aug = self.generator.reparameterize(mu, std)
-            recon = self.generator.decode(z_aug)
-            r_output = self.classifier(F.dropout(recon, p=0.1))
-            return output, r_output, mu, std
+        return self.classifier(F.dropout(concat, p=0.1, training=self.training))
 
-        return output
 
-    def freeze_grad(self, generate=False):
-        """
-        generate=False -> train the task network (encoders + classifier), freeze the VAE.
-        generate=True  -> train the VAE generator, freeze the task network.
-        """
-        for module in self.children():
-            requires_grad = generate if isinstance(module, VAE) else not generate
-            for p in module.parameters():
-                p.requires_grad = requires_grad
+class FocalLoss(nn.Module):
+    """
+    Focal loss (Lin et al., 2017), with per-class weights set via the
+    Effective Number of Samples (Cui et al., 2019,
+    https://arxiv.org/abs/1901.05555) instead of a hand-picked alpha.
 
-class FocalLoss(nn.Module): 
-    def __init__(self, gamma=2.0, alpha=0.969): 
+    Each class's "effective number" is E_y = (1 - beta**n_y) / (1 - beta),
+    where n_y is that class's sample count: as n_y grows, additional samples
+    increasingly overlap with ones already seen (near-duplicate information
+    content), so E_y grows sublinearly and saturates as beta -> 1. Weighting
+    inversely by E_y gives the minority class a more principled boost than a
+    hand-tuned alpha, and degrades to plain inverse-frequency weighting as
+    beta -> 0.
+    """
+    def __init__(self, class_counts, gamma: float = 2.0, beta: float = 0.9999):
         super().__init__()
         self.gamma = gamma
-        self.alpha = alpha
-        
-    def forward(self, logits, labels):
+        class_counts = torch.as_tensor(class_counts, dtype=torch.float32)
+        effective_num = 1.0 - torch.pow(beta, class_counts)
+        class_weights = (1.0 - beta) / effective_num
+        class_weights = class_weights / class_weights.sum() * len(class_counts)
+        self.register_buffer("class_weights", class_weights)
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         ce = F.cross_entropy(logits, labels, reduction="none")
         pt = torch.exp(-ce)
-        alpha_t = torch.where(labels == 1, self.alpha, 1 - self.alpha)
+        alpha_t = self.class_weights[labels]
         return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
 
-def train_augmented_epoch(args, loader, model, task_optimizer, aug_optimizer, task_fn, consist_fn,
-                           alpha=0.5, w1=1e-4, w2=0.1, w3=0.1):
-    """
-    LeMDA training step (Liu et al., 2022)
-    """
+
+def train_epoch(loader, model: FusionModule, optimizer, loss_fn: FocalLoss):
+    """Run one training pass over `loader`, returning (avg_loss, accuracy)."""
     model.train()
     total_loss, correct, total = 0, 0, 0
-    for signals, demographics, labels in tqdm(loader, desc="Train (LeMDA)", leave=False):
+    for signals, demographics, labels in tqdm(loader, desc="Train", leave=False):
         signals = signals.to(config.device)
         demographics = demographics.to(config.device)
         labels = labels.to(config.device).long()
 
-        # Task Network update
-        model.freeze_grad(generate=False)
-        task_optimizer.zero_grad()
-        output, r_output, _, _ = model(signals, demographics, reconstruct=True)
-        loss_task = task_fn(output, labels) + task_fn(r_output, labels)
-        loss_task.backward()
-        task_optimizer.step()
+        optimizer.zero_grad()
+        logits = model(signals, demographics)
+        loss = loss_fn(logits, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        optimizer.step()
 
-        # Augmentation Network update
-        model.freeze_grad(generate=True)
-        aug_optimizer.zero_grad()
-        output_g, r_output_g, mu, std = model(signals, demographics, reconstruct=True)
-
-        # confidence masking, as mentioned in the paper to avoid the model learning from low-confidence predictions
-        with torch.no_grad(): 
-            confident = F.softmax(output_g, dim=-1).amax(dim=-1) > alpha
-
-        adv_loss = task_fn(r_output_g, labels)
-        if confident.any():
-            log_p_aug = F.log_softmax(r_output_g[confident], dim=-1)
-            p_orig = F.softmax(output_g[confident], dim=-1).detach()
-            consist_loss = consist_fn(log_p_aug, p_orig)
-        else:
-            consist_loss = torch.zeros((), device=config.device)
-        kl_loss = model.generator.kl_loss(mu, std)
-
-        loss_aug = -w1 * adv_loss + w2 * consist_loss + w3 * kl_loss
-        loss_aug.backward()
-        aug_optimizer.step()
-
-        model.freeze_grad(generate=False)  # leave task net trainable/unfrozen by default
-
-        total_loss += loss_task.item()
-        correct += (output.argmax(dim=-1) == labels).sum().item()
+        total_loss += loss.item()
+        correct += (logits.argmax(dim=-1) == labels).sum().item()
         total += len(labels)
 
     return total_loss / len(loader), correct / total
 
-def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="results"):
+
+def eval_epoch(loader, model: FusionModule, loss_fn: FocalLoss):
+    """
+    Run one no-grad evaluation pass over `loader`.
+
+    Returns:
+        (avg_loss, accuracy, sensitivity, specificity, auprc, auroc, preds, labels)
+    """
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+    all_preds, all_labels, all_probs = [], [], []
+    with torch.no_grad():
+        for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
+            signals = signals.to(config.device)
+            demographics = demographics.to(config.device)
+            labels = labels.to(config.device).long()
+
+            logits = model(signals, demographics)
+            loss = loss_fn(logits, labels)
+
+            total_loss += loss.item()
+            probs = F.softmax(logits, dim=-1)[:, 1]
+            preds = logits.argmax(dim=-1)
+            correct += (preds == labels).sum().item()
+            total += len(labels)
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+            all_probs.extend(probs.cpu().tolist())
+
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    has_both_classes = len(set(all_labels)) > 1
+    auprc = average_precision_score(all_labels, all_probs) if has_both_classes else 0.0
+    auroc = roc_auc_score(all_labels, all_probs) if has_both_classes else 0.0
+    return total_loss / len(loader), correct / total, sensitivity, specificity, auprc, auroc, all_preds, all_labels
+
+
+def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name: str = "larycl_results"):
+    """Plot loss/accuracy curves and a confusion matrix, saved to `graphs/{file_name}.png`."""
     epochs = range(1, len(train_losses) + 1)
     _, axes = plt.subplots(1, 3, figsize=(16, 4))
 
@@ -318,91 +206,92 @@ def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_lab
     plt.show()
 
 
-def eval_epoch(loader, model, loss_fn):
-    model.eval()
-    total_loss, correct, total = 0, 0, 0
-    all_preds, all_labels, all_probs = [], [], []
-    with torch.no_grad():
-        for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
-            signals = signals.to(config.device)
-            demographics = demographics.to(config.device)
-            labels = labels.to(config.device).long()
-
-            logits = model(signals, demographics)
-            loss = loss_fn(logits, labels)
-
-            total_loss += loss.item()
-            probs = F.softmax(logits, dim=-1)[:, 1]
-            preds = logits.argmax(dim=-1)
-            correct += (preds == labels).sum().item()
-            total += len(labels)
-            all_preds.extend(preds.cpu().tolist())
-            all_labels.extend(labels.cpu().tolist())
-            all_probs.extend(probs.cpu().tolist())
-
-    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    auprc = average_precision_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
-    return total_loss / len(loader), correct / total, sensitivity, specificity, auprc, all_preds, all_labels
-
 def parse_args():
-    parser = ArgumentParser(description="Train multimodal throat cancer classifier")
+    parser = ArgumentParser(description="Train LaryFusion: fusion classifier with modality dropout, stratified k-fold CV")
     parser.add_argument("--name", type=str, required=True, help="Name of your model")
-    parser.add_argument("--results_name", type=str, default="results", help="What to name the result diagram")
+    parser.add_argument("--gate", action="store_true", help="Use a sigmoid gate over the fused features")
+    parser.add_argument("--modality_dropout", type=float, default=0.1,
+                         help="Per-modality dropout probability applied before fusion during training")
+    parser.add_argument("--n_splits", type=int, default=5, help="Number of stratified k-fold splits")
+    parser.add_argument("--beta", type=float, default=0.9999,
+                         help="Effective-number-of-samples beta for class-balanced FocalLoss "
+                              "(closer to 1 = more aggressive minority-class upweighting)")
+    parser.add_argument("--results_name", type=str, default="laryfusion_results", help="What to name the result diagrams")
     return parser.parse_args()
 
-def main(): 
+
+def main():
+    """
+    Train one FusionModule per stratified k-fold split, checkpointing each
+    fold's best epoch (by validation loss) to
+    `checkpoints/{name}_fold{k}_best.pt`, with early stopping after
+    `config.patience` epochs of no improvement. Reports mean +/- std
+    accuracy/sensitivity/specificity/AUPRC/AUROC across folds.
+    """
     args = parse_args()
-    dataset = load_wavs(include_demographics=True)
-    train_data, test_data = cross_validation(dataset)
-    train_loader = batch_inputs(train_data, shuffle=True)
-    test_loader = batch_inputs(test_data)
 
-    dinput_dim = len(train_data[0]["background"])
-    model = AugmentedFusion(config, num_features=dinput_dim, gate=True).to(config.device)
-    
-    loss_fn = FocalLoss().to(config.device)
-    consist_fn = nn.KLDivLoss(reduction="batchmean").to(config.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    aug_optimizer = torch.optim.Adam(model.generator.parameters(), lr=config.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    print("Loading dataset...")
+    dataset = load_patients(feature_type="wav2vec2", include_demographics=True)
 
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
+    fold_metrics = []
+    for fold, (train_data, test_data) in enumerate(stratified_kfold(dataset, n_splits=args.n_splits), start=1):
+        print(f"\n=== Fold {fold}/{args.n_splits} ===")
+        train_loader = batch_inputs(train_data, stratify=True)
+        test_loader = batch_inputs(test_data)
 
-    print(f"Model layout: {model}")
-    print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
+        dinput_dim = len(train_data[0]["background"])
+        model = FusionModule(config, num_features=dinput_dim, gate=args.gate,
+                              p_drop=args.modality_dropout).to(config.device)
 
-    best_loss = float("inf")
-    no_improv = 0
-    for epoch in range(1, config.num_epochs + 1):
-        tr_loss, tr_acc = train_augmented_epoch(args, train_loader, model, optimizer, aug_optimizer, loss_fn, consist_fn)
-        val_loss, val_acc, val_sens, val_spec, val_auprc, preds, labels = eval_epoch(test_loader, model, loss_fn)
+        class_counts = [sum(1 for p in train_data if p["label"] == c) for c in (0, 1)]
+        loss_fn = FocalLoss(class_counts=class_counts, beta=args.beta).to(config.device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-5, eps=1e-6)
 
-        train_losses.append(tr_loss)
-        val_losses.append(val_loss)
-        train_accs.append(tr_acc)
-        val_accs.append(val_acc)
+        if fold == 1:
+            print(f"Model layout: {model}")
+            print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
-        print(f"Epoch {epoch:02d} | "
-            f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auprc: {val_auprc:.3f}")
+        train_losses, val_losses = [], []
+        train_accs, val_accs = [], []
+        best_val_loss = float('inf')
+        best_metrics = None
+        no_improv = 0
+        for epoch in range(1, config.num_epochs + 1):
+            tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
+            val_loss, val_acc, val_sens, val_spec, val_auprc, val_auroc, preds, labels = eval_epoch(
+                test_loader, model, loss_fn)
 
-        if val_loss < best_loss:
-            print("Updating best model...")
-            best_loss = val_loss
-            no_improv = 0
-            torch.save(model.state_dict(), f"checkpoints/{args.name}_best.pt")
-            visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, args.results_name)
+            train_losses.append(tr_loss)
+            val_losses.append(val_loss)
+            train_accs.append(tr_acc)
+            val_accs.append(val_acc)
 
-        else:
-            no_improv += 1
-            if no_improv >= config.patience:
-                print(f"No improvement in val loss for {config.patience} epochs, stopping early.")
-                break
-        
-        scheduler.step(val_loss)
+            print(f"Epoch {epoch:02d} | "
+                  f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
+                  f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} "
+                  f"specificity: {val_spec:.3f} auprc: {val_auprc:.3f} auroc: {val_auroc:.3f}")
+
+            if val_loss < best_val_loss:
+                print("Updating best model...")
+                best_val_loss = val_loss
+                no_improv = 0
+                best_metrics = (val_acc, val_sens, val_spec, val_auprc, val_auroc)
+                torch.save(model.state_dict(), f"checkpoints/{args.name}_fold{fold}_best.pt")
+                visualize(train_losses, val_losses, train_accs, val_accs, preds, labels,
+                          f"{args.results_name}_fold{fold}")
+            else:
+                no_improv += 1
+                if no_improv >= config.patience:
+                    print(f"No improvement in val loss for {config.patience} epochs, stopping fold {fold} early.")
+                    break
+
+        fold_metrics.append(best_metrics)
+
+    _, senss, specs, auprcs, _ = zip(*fold_metrics)
+    print("\n=== K-Fold Summary ===")
+    print(f"Sensitivity: {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
+    print(f"Specificity: {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
+    print(f"AUPRC:       {np.mean(auprcs):.3f} +/- {np.std(auprcs):.3f}")
 
 if __name__ == '__main__':
     main()
