@@ -7,3 +7,5 @@ librosa
 transformers
 peft
 imblearn
+opensmile
+praat-parselmouth

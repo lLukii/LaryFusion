@@ -1,148 +1,122 @@
+"""All PyTorch model architectures used across the baseline/fusion scripts."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Wav2Vec2Model
 
-class FusionModule(nn.Module):
+
+class AudioEncoder(nn.Module):
     """
-    Multimodal Fusion Model for Audio and Demographic Data
+    Wav2Vec2Model wrapper, mean-pooled transformer output. The transformer
+    is fully frozen (even LoRA still overfit); the CNN feature extractor and
+    its projection into the transformer stay trainable.
     """
-    def __init__(self, config, num_features, hidden_dim=512, gate=False):
+    def __init__(self, w2v_name, latent_dim=256):
         super().__init__()
-        self.demographic_enc = nn.Sequential(
-            nn.Linear(num_features, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
-        self.classifier = nn.Linear(2 * hidden_dim, 2)
-        self.gate_a = nn.Sequential(
-            nn.Linear(2 * hidden_dim, 2 * hidden_dim), 
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(2 * hidden_dim, 2 * hidden_dim)
-        ) if gate else None
-        self.gate_b = nn.Sequential(
-            nn.Linear(2 * hidden_dim, 2 * hidden_dim), 
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(2 * hidden_dim, 2 * hidden_dim)
-        ) if gate else None
+        self.encoder = Wav2Vec2Model.from_pretrained(w2v_name)
+        self.output_dim = latent_dim
+        self.proj = nn.Linear(self.encoder.config.hidden_size, latent_dim)
+        for param in self.encoder.encoder.parameters():
+            param.requires_grad = False
 
-    def forward(self, audio, demographic):
-        z_A = self.aud_encoder(audio).extract_features
-        z_A = torch.mean(z_A, dim=1)
-        z_D = self.demographic_enc(demographic)
-        concat = torch.cat((z_A, z_D), dim=-1)
-        if self.gate_a: 
-            A = self.gate_a(concat)
-            B = F.sigmoid(self.gate_b(concat)) # [B, 2 * dim]
-            concat = A * B # [B, 2 * dim]
+    def forward(self, audio):
+        return self.proj(self.encoder(audio).last_hidden_state.mean(dim=1))
 
-        outputs = self.classifier(F.dropout(concat, p=0.1))
-        return outputs
 
 class Wav2VecBase(nn.Module):
-    """
-    Base classifier model using Wav2Vec2 for audio feature extraction.
-    Conv + Linear layer 
-    """
-    def __init__(self, config, output_dim=512):
+    """Audio-only classifier: pooled wav2vec2 features -> linear head."""
+    def __init__(self, config):
         super().__init__()
-        self.encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
-        self.classifier = nn.Linear(output_dim, 2)
-    
-    def forward(self, signals, demographics=None): 
-        encoded = self.encoder(signals).extract_features
-        encoded = torch.mean(encoded, dim=1)
-        encoded = self.classifier(F.dropout(encoded, p=0.1))
-        return encoded
+        self.aud_encoder = AudioEncoder(config.w2v_name)
+        self.classifier = nn.Linear(self.aud_encoder.output_dim, 2)
 
-class FocalLoss(nn.Module):
+    def forward(self, signals: torch.Tensor, demographics: torch.Tensor = None) -> torch.Tensor:
+        z_A = self.aud_encoder(signals)
+        return self.classifier(F.dropout(z_A, p=0.1, training=self.training))
+
+
+class FusionModule(nn.Module):
     """
-    Focal loss to handle class imbalance.
-    alpha: weight for the class
-    gamma: focusing parameter to reduce the loss contribution from easy examples
-    logits: whether the inputs are logits or probabilities
+    Audio (wav2vec2) + demographic (MLP) fusion classifier. `gate` adds a
+    sigmoid gate over the fused features; `p_drop` > 0 adds modality dropout
+    (each modality independently zeroed with that probability during
+    training).
     """
-    def __init__(self, alpha=1, gamma=2, logits=False, reduce=True):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.logits = logits
-        self.reduce = reduce
+    def __init__(self, config, num_features: int, demo_dim: int = 64,
+                 gate: bool = False, p_drop: float = 0.0):
+        super().__init__()
+        self.p_drop = p_drop
+        self.aud_encoder = AudioEncoder(config.w2v_name)
+        combined_dim = self.aud_encoder.output_dim + demo_dim
+        self.demographic_enc = nn.Sequential(
+            nn.Linear(num_features, demo_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(demo_dim, demo_dim),
+        )
+        self.classifier = nn.Linear(combined_dim, 2)
+        self.gate = nn.Sequential(
+            nn.Linear(combined_dim, combined_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(combined_dim, combined_dim),
+        ) if gate else None
 
-    def forward(self, inputs, targets):
-        if self.logits:
-            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        else:
-            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+    def forward(self, audio: torch.Tensor, demographic: torch.Tensor) -> torch.Tensor:
+        z_A = self.aud_encoder(audio)
+        z_D = self.demographic_enc(demographic)
 
-        if self.reduce:
-            return torch.mean(F_loss)
-        else:
-            return F_loss
+        if self.training and self.p_drop > 0:
+            keep_a = (torch.rand(z_A.size(0), 1, device=z_A.device) >= self.p_drop).float()
+            keep_d = (torch.rand(z_D.size(0), 1, device=z_D.device) >= self.p_drop).float()
+            z_A = z_A * keep_a
+            z_D = z_D * keep_d
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride = 1, downsample = None):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=3, 
-                            stride=stride, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU())
-        self.conv2 = nn.Sequential(
-                nn.Conv2d(out_channels, out_channels, 
-                            kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(out_channels))
-        self.downsample = downsample
-        self.relu = nn.ReLU()
-        self.out_channels = out_channels
+        concat = torch.cat((z_A, z_D), dim=-1)
+        if self.gate:
+            concat = concat * torch.sigmoid(self.gate(concat))
 
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.conv2(out)
-        if self.downsample:
-            residual = self.downsample(x)
-        out += residual
-        out = self.relu(out)
-        return out
+        return self.classifier(F.dropout(concat, p=0.1, training=self.training))
 
-class ResNet(nn.Module):
-    """
-    ResNet-18 implementation for audio encoding.
-    Expects spectrogram input with dimension (B, 80, 188) 
-    """
-    def __init__(self, block=ResidualBlock, layers=[2, 2, 2, 2], hidden_dim=512):
-        super(ResNet, self).__init__()
-        self.inplanes = 64
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size = 7, stride = 2, padding = 3),
-            nn.BatchNorm2d(64),
-            nn.ReLU())
-        self.maxpool = nn.MaxPool2d(kernel_size = 3, stride = 2, padding = 1)
-        self.layer0 = self._make_layer(block, 64, layers[0], stride = 1)
-        self.layer1 = self._make_layer(block, 128, layers[1], stride = 2)
-        self.layer2 = self._make_layer(block, 256, layers[2], stride = 2)
-        self.layer3 = self._make_layer(block, 512, layers[3], stride = 2)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, hidden_dim)
 
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(planes),
-            )
-        layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes
-        for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+class ConvBlock1D(nn.Module):
+    """Conv1d -> BatchNorm -> ReLU, optionally max-pooled."""
+    def __init__(self, in_channels: int, out_channels: int, pool_size: int = None, kernel_size: int = 3):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.pool = nn.MaxPool1d(pool_size) if pool_size else None
 
-        return nn.Sequential(*layers)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn(self.conv(x)))
+        return self.pool(x) if self.pool else x
+
+
+class CNN1D(nn.Module):
+    """Six-block 1D-CNN over raw waveform (Kim et al., 2020). Audio-only."""
+    def __init__(self, num_classes: int = 2):
+        super().__init__()
+        self.blocks = nn.Sequential(
+            ConvBlock1D(1, 16),
+            ConvBlock1D(16, 32, pool_size=8),
+            ConvBlock1D(32, 64, pool_size=8),
+            ConvBlock1D(64, 128, pool_size=8),
+            ConvBlock1D(128, 256, pool_size=8),
+            ConvBlock1D(256, 256),
+        )
+        self.adaptive_pool = nn.AdaptiveMaxPool1d(6)
+        self.classifier = nn.Sequential(
+            nn.Linear(6 * 256, 100),
+            nn.ReLU(),
+            nn.Linear(100, 50),
+            nn.ReLU(),
+            nn.Linear(50, num_classes),
+        )
+
+    def forward(self, signals: torch.Tensor, demographics: torch.Tensor = None) -> torch.Tensor:
+        x = signals.unsqueeze(1)  # (B, T) -> (B, 1, T)
+        x = self.blocks(x)
+        x = self.adaptive_pool(x)
+        x = x.flatten(1)
+        return self.classifier(x)
