@@ -15,6 +15,7 @@ Run from `src/`:
     python cnn1d.py --name cnn1d_v1
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,55 +26,14 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, average_precision_score
 
 from config import Config
-from dataset import load_patients, cross_validation, batch_inputs
+from dataset import load_patients, stratified_kfold, batch_inputs
+from models import CNN1D
 
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
 torch.manual_seed(1337)
-
-
-class ConvBlock1D(nn.Module):
-    """Conv1d -> BatchNorm -> ReLU, optionally followed by max pooling."""
-    def __init__(self, in_channels, out_channels, pool_size=None, kernel_size=3):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
-        self.bn = nn.BatchNorm1d(out_channels)
-        self.pool = nn.MaxPool1d(pool_size) if pool_size else None
-
-    def forward(self, x):
-        x = F.relu(self.bn(self.conv(x)))
-        return self.pool(x) if self.pool else x
-
-
-class CNN1D(nn.Module):
-    """Six-block 1D-CNN over raw waveform, see module docstring for the paper this reproduces."""
-    def __init__(self, num_classes=2):
-        super().__init__()
-        self.blocks = nn.Sequential(
-            ConvBlock1D(1, 16),
-            ConvBlock1D(16, 32, pool_size=8),
-            ConvBlock1D(32, 64, pool_size=8),
-            ConvBlock1D(64, 128, pool_size=8),
-            ConvBlock1D(128, 256, pool_size=8),
-            ConvBlock1D(256, 256),
-        )
-        self.adaptive_pool = nn.AdaptiveMaxPool1d(6)
-        self.classifier = nn.Sequential(
-            nn.Linear(6 * 256, 100),
-            nn.ReLU(),
-            nn.Linear(100, 50),
-            nn.ReLU(),
-            nn.Linear(50, num_classes),
-        )
-
-    def forward(self, signals, demographics=None):
-        x = signals.unsqueeze(1)  # (B, T) -> (B, 1, T)
-        x = self.blocks(x)
-        x = self.adaptive_pool(x)
-        x = x.flatten(1)
-        return self.classifier(x)
 
 
 class FocalLoss(nn.Module):
@@ -179,61 +139,77 @@ def parse_args():
     parser = ArgumentParser(description="Train 1D-CNN baseline (raw waveform, Kim et al. 2020 architecture)")
     parser.add_argument("--name", type=str, required=True, help="Name of your model")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--n_splits", type=int, default=5, help="Number of stratified k-fold splits")
     parser.add_argument("--results_name", type=str, default="cnn1d_results", help="What to name the result diagram")
     return parser.parse_args()
 
 
 def main():
     """
-    Train the 1D-CNN and checkpoint the best epoch by validation loss to
-    `checkpoints/{name}_best.pt`, with early stopping after `config.patience`
-    epochs of no improvement.
+    Train one CNN1D per stratified k-fold split, checkpointing each fold's
+    best epoch (by validation loss) to `checkpoints/{name}_fold{k}_best.pt`,
+    with early stopping after `config.patience` epochs of no improvement.
+    Reports mean +/- std metrics across folds.
     """
     args = parse_args()
 
     print("Loading dataset...")
     patients = load_patients(feature_type="raw")
-    train_data, test_data = cross_validation(patients)
 
-    train_loader = batch_inputs(train_data, stratify=True)
-    test_loader = batch_inputs(test_data)
+    fold_metrics = []
+    for fold, (train_data, test_data) in enumerate(stratified_kfold(patients, n_splits=args.n_splits), start=1):
+        print(f"\n=== Fold {fold}/{args.n_splits} ===")
+        train_loader = batch_inputs(train_data, stratify=True)
+        test_loader = batch_inputs(test_data)
 
-    model = CNN1D().to(config.device)
-    loss_fn = FocalLoss().to(config.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        model = CNN1D().to(config.device)
+        loss_fn = FocalLoss().to(config.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
+        train_losses, val_losses = [], []
+        train_accs, val_accs = [], []
 
-    print(f"Model layout: {model}")
-    print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
+        if fold == 1:
+            print(f"Model layout: {model}")
+            print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
-    best_loss = float('inf')
-    no_improv = 0
-    for epoch in range(1, config.num_epochs + 1):
-        tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
-        val_loss, val_acc, val_sens, val_spec, val_auprc, preds, labels = eval_epoch(test_loader, model, loss_fn)
+        best_loss = float('inf')
+        best_metrics = None
+        no_improv = 0
+        for epoch in range(1, config.num_epochs + 1):
+            tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
+            val_loss, val_acc, val_sens, val_spec, val_auprc, preds, labels = eval_epoch(test_loader, model, loss_fn)
 
-        train_losses.append(tr_loss)
-        val_losses.append(val_loss)
-        train_accs.append(tr_acc)
-        val_accs.append(val_acc)
+            train_losses.append(tr_loss)
+            val_losses.append(val_loss)
+            train_accs.append(tr_acc)
+            val_accs.append(val_acc)
 
-        print(f"Epoch {epoch:02d} | "
-            f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-            f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auprc: {val_auprc:.3f}")
+            print(f"Epoch {epoch:02d} | "
+                f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
+                f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auprc: {val_auprc:.3f}")
 
-        if val_loss < best_loss:
-            print("Updating best model...")
-            best_loss = val_loss
-            no_improv = 0
-            torch.save(model.state_dict(), f"../checkpoints/{args.name}_best.pt")
-            visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, args.results_name)
-        else:
-            no_improv += 1
-            if no_improv >= config.patience:
-                print(f"No improvement in val loss for {config.patience} epochs, stopping early.")
-                break
+            if val_loss < best_loss:
+                print("Updating best model...")
+                best_loss = val_loss
+                no_improv = 0
+                best_metrics = (val_acc, val_sens, val_spec, val_auprc)
+                torch.save(model.state_dict(), f"../checkpoints/{args.name}_fold{fold}_best.pt")
+                visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, f"{args.results_name}_fold{fold}")
+            else:
+                no_improv += 1
+                if no_improv >= config.patience:
+                    print(f"No improvement in val loss for {config.patience} epochs, stopping fold {fold} early.")
+                    break
+
+        fold_metrics.append(best_metrics)
+
+    accs, senss, specs, auprcs = zip(*fold_metrics)
+    print("\n=== K-Fold Summary ===")
+    print(f"Accuracy:    {np.mean(accs):.3f} +/- {np.std(accs):.3f}")
+    print(f"Sensitivity: {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
+    print(f"Specificity: {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
+    print(f"AUPRC:       {np.mean(auprcs):.3f} +/- {np.std(auprcs):.3f}")
 
 
 if __name__ == '__main__':

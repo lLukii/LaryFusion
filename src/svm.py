@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 from argparse import ArgumentParser
 from sklearn.svm import SVC
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
@@ -59,6 +59,7 @@ def visualize(all_labels, all_preds, file_name="svm_results"):
 
 def parse_args():
     parser = ArgumentParser(description="Train SVM baseline (Praat jitter/shimmer/F0/periodicity + age)")
+    parser.add_argument("--n_splits", type=int, default=5, help="Number of stratified k-fold splits")
     parser.add_argument("--results_name", type=str, default="svm_results", help="What to name the result diagram")
     return parser.parse_args()
 
@@ -69,37 +70,56 @@ def main():
     print("Loading dataset and extracting Praat acoustic features...")
     patients = load_patients(feature_type="praat", include_demographics=True)
     patient_list = list(patients.values())
-    train_data, test_data = train_test_split(patient_list, test_size=0.2, random_state=config.seed)
+    labels = [p["label"] for p in patient_list]
 
-    X_train, y_train = build_dataset(train_data)
-    X_test, y_test = build_dataset(test_data)
+    # Uses its own StratifiedKFold (not dataset.stratified_kfold) so Age stays
+    # raw/unnormalized in "background" until the single full-matrix
+    # StandardScaler below - dataset.stratified_kfold's per-fold demographic
+    # z-scoring would otherwise double-normalize Age.
+    skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=config.seed)
 
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    fold_metrics = []
+    for fold, (train_idx, test_idx) in enumerate(skf.split(patient_list, labels), start=1):
+        print(f"\n=== Fold {fold}/{args.n_splits} ===")
+        train_data = [patient_list[i] for i in train_idx]
+        test_data = [patient_list[i] for i in test_idx]
 
-    param_grid = {
-        "C": [0.1, 1, 10, 100],
-        "gamma": ["scale", "auto", 0.4, 0.8, 1.6, 3.2],
-        "kernel": ["rbf", "poly"],
-    }
-    grid = GridSearchCV(SVC(class_weight="balanced"), param_grid, scoring="roc_auc", cv=5, n_jobs=-1)
-    grid.fit(X_train, y_train)
+        X_train, y_train = build_dataset(train_data)
+        X_test, y_test = build_dataset(test_data)
 
-    print(f"Best params: {grid.best_params_}")
-    model = grid.best_estimator_
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
 
-    preds = model.predict(X_test)
-    scores = model.decision_function(X_test)
+        param_grid = {
+            "C": [0.1, 1, 10, 100],
+            "gamma": ["scale", "auto", 0.4, 0.8, 1.6, 3.2],
+            "kernel": ["rbf", "poly"],
+        }
+        grid = GridSearchCV(SVC(class_weight="balanced"), param_grid, scoring="roc_auc", cv=5, n_jobs=-1)
+        grid.fit(X_train, y_train)
 
-    tn, fp, fn, tp = confusion_matrix(y_test, preds, labels=[0, 1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    auroc = roc_auc_score(y_test, scores)
+        print(f"Best params: {grid.best_params_}")
+        model = grid.best_estimator_
 
-    print(f"Test sensitivity: {sensitivity:.3f} specificity: {specificity:.3f} auroc: {auroc:.3f}")
+        preds = model.predict(X_test)
+        scores = model.decision_function(X_test)
 
-    visualize(y_test, preds, args.results_name)
+        tn, fp, fn, tp = confusion_matrix(y_test, preds, labels=[0, 1]).ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        auroc = roc_auc_score(y_test, scores)
+
+        print(f"Fold {fold} test sensitivity: {sensitivity:.3f} specificity: {specificity:.3f} auroc: {auroc:.3f}")
+
+        visualize(y_test, preds, f"{args.results_name}_fold{fold}")
+        fold_metrics.append((sensitivity, specificity, auroc))
+
+    senss, specs, aurocs = zip(*fold_metrics)
+    print("\n=== K-Fold Summary ===")
+    print(f"Sensitivity: {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
+    print(f"Specificity: {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
+    print(f"AUROC:       {np.mean(aurocs):.3f} +/- {np.std(aurocs):.3f}")
 
 
 if __name__ == '__main__':

@@ -16,10 +16,6 @@ metrics are reported as mean +/- std across folds, which matters here since
 a single 80/20 split leaves only a handful of malignant validation examples
 and its point-estimate metrics carry a lot of split-dependent variance.
 
-Class-balanced loss: `FocalLoss`'s per-class weight is set via the
-Effective Number of Samples (Cui et al., 2019, arxiv.org/abs/1901.05555)
-rather than a hand-picked alpha - see the class docstring below.
-
 Run from `src/`:
     python laryfusion.py --name laryfusion_v1
 """
@@ -33,89 +29,32 @@ import matplotlib.pyplot as plt
 
 from argparse import ArgumentParser
 from tqdm import tqdm
-from transformers import Wav2Vec2Model
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, average_precision_score, roc_auc_score
 
 from config import Config
 from dataset import load_patients, stratified_kfold, batch_inputs
+from models import Wav2VecBase, FusionModule
 
 import warnings
 warnings.filterwarnings("ignore")
 
 config = Config()
 
-
-class FusionModule(nn.Module):
-    """
-    Audio (Wav2Vec2Model) + demographic (MLP) fusion classifier with
-    modality dropout (see module docstring) and an optional sigmoid gate
-    over the fused features, matching `ablations.py`'s `FusionModule`.
-    """
-    def __init__(self, config: Config, num_features: int, audio_dim: int = 512,
-                 demo_dim: int = 64, gate: bool = False, p_drop: float = 0.1):
-        super().__init__()
-        combined_dim = audio_dim + demo_dim
-        self.p_drop = p_drop
-        self.demographic_enc = nn.Sequential(
-            nn.Linear(num_features, demo_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(demo_dim, demo_dim),
-        )
-        self.aud_encoder = Wav2Vec2Model.from_pretrained(config.w2v_name)
-        self.classifier = nn.Linear(combined_dim, 2)
-        self.gate = nn.Sequential(
-            nn.Linear(combined_dim, combined_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(combined_dim, combined_dim),
-        ) if gate else None
-
-    def forward(self, audio: torch.Tensor, demographic: torch.Tensor) -> torch.Tensor:
-        z_A = self.aud_encoder(audio).extract_features.mean(dim=1)
-        z_D = self.demographic_enc(demographic)
-
-        if self.training and self.p_drop > 0:
-            keep_a = (torch.rand(z_A.size(0), 1, device=z_A.device) >= self.p_drop).float()
-            keep_d = (torch.rand(z_D.size(0), 1, device=z_D.device) >= self.p_drop).float()
-            z_A = z_A * keep_a
-            z_D = z_D * keep_d
-
-        concat = torch.cat((z_A, z_D), dim=-1)
-        if self.gate:
-            weights = torch.sigmoid(self.gate(concat))
-            concat = concat * weights
-
-        return self.classifier(F.dropout(concat, p=0.1, training=self.training))
-
-
 class FocalLoss(nn.Module):
     """
-    Focal loss (Lin et al., 2017), with per-class weights set via the
-    Effective Number of Samples (Cui et al., 2019,
-    https://arxiv.org/abs/1901.05555) instead of a hand-picked alpha.
-
-    Each class's "effective number" is E_y = (1 - beta**n_y) / (1 - beta),
-    where n_y is that class's sample count: as n_y grows, additional samples
-    increasingly overlap with ones already seen (near-duplicate information
-    content), so E_y grows sublinearly and saturates as beta -> 1. Weighting
-    inversely by E_y gives the minority class a more principled boost than a
-    hand-tuned alpha, and degrades to plain inverse-frequency weighting as
-    beta -> 0.
+    Focal loss (Lin et al., 2017) for the class-imbalanced benign/normal vs.
+    malignant split: down-weights easy, well-classified examples (via
+    `(1-pt)**gamma`) and reweights classes by `alpha`/`1-alpha`.
     """
-    def __init__(self, class_counts, gamma: float = 2.0, beta: float = 0.9999):
+    def __init__(self, gamma=2.0, alpha=0.969):
         super().__init__()
         self.gamma = gamma
-        class_counts = torch.as_tensor(class_counts, dtype=torch.float32)
-        effective_num = 1.0 - torch.pow(beta, class_counts)
-        class_weights = (1.0 - beta) / effective_num
-        class_weights = class_weights / class_weights.sum() * len(class_counts)
-        self.register_buffer("class_weights", class_weights)
+        self.alpha = alpha
 
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits, labels):
         ce = F.cross_entropy(logits, labels, reduction="none")
         pt = torch.exp(-ce)
-        alpha_t = self.class_weights[labels]
+        alpha_t = torch.where(labels == 1, self.alpha, 1 - self.alpha)
         return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
 
 
@@ -209,16 +148,22 @@ def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_lab
 def parse_args():
     parser = ArgumentParser(description="Train LaryFusion: fusion classifier with modality dropout, stratified k-fold CV")
     parser.add_argument("--name", type=str, required=True, help="Name of your model")
+    parser.add_argument("--model_type", type=int, default=1, help="Select a modal type")
     parser.add_argument("--gate", action="store_true", help="Use a sigmoid gate over the fused features")
     parser.add_argument("--modality_dropout", type=float, default=0.1,
                          help="Per-modality dropout probability applied before fusion during training")
     parser.add_argument("--n_splits", type=int, default=5, help="Number of stratified k-fold splits")
-    parser.add_argument("--beta", type=float, default=0.9999,
-                         help="Effective-number-of-samples beta for class-balanced FocalLoss "
-                              "(closer to 1 = more aggressive minority-class upweighting)")
     parser.add_argument("--results_name", type=str, default="laryfusion_results", help="What to name the result diagrams")
     return parser.parse_args()
 
+def get_model(num, dinput_dim): 
+    model = None
+    match num: 
+        case 1: model = FusionModule(config, dinput_dim, gate=True, p_drop=0.1)
+        case 2: model = FusionModule(config, dinput_dim)
+        case 3: model = Wav2VecBase(config)
+
+    return model.to(config.device)
 
 def main():
     """
@@ -240,11 +185,8 @@ def main():
         test_loader = batch_inputs(test_data)
 
         dinput_dim = len(train_data[0]["background"])
-        model = FusionModule(config, num_features=dinput_dim, gate=args.gate,
-                              p_drop=args.modality_dropout).to(config.device)
-
-        class_counts = [sum(1 for p in train_data if p["label"] == c) for c in (0, 1)]
-        loss_fn = FocalLoss(class_counts=class_counts, beta=args.beta).to(config.device)
+        model = get_model(args.model_type)
+        loss_fn = FocalLoss().to(config.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-5, eps=1e-6)
 
         if fold == 1:

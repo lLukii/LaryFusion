@@ -3,27 +3,21 @@ Shared data-loading pipeline for every training script in this project.
 Centralizes: walking the raw `.wav` dataset + `medicalhistory.xlsx` files,
 the four supported audio feature representations, the train/test split +
 demographic normalization, and the PyTorch Dataset/DataLoader/batch-sampler
-plumbing used by the neural-net baselines.
-
-Audio feature backends (`feature_type` passed to `load_patients`):
-    "wav2vec2"  - Wav2Vec2FeatureExtractor-processed raw waveform (larycl.py, ablations.py)
-    "raw"       - padded/truncated raw waveform, no processing (cnn1d.py)
-    "opensmile" - OpenSMILE eGeMAPSv02 functionals (logisticreg.py)
-    "praat"     - Praat/parselmouth jitter/shimmer/F0/HNR features (svm.py)
-Each backend's third-party dependency (transformers/opensmile/parselmouth)
-is imported lazily inside its extraction function, so a script that only
-uses one backend doesn't need the others installed.
+plumbing used by the neural-net baselines. 
 """
 
 import librosa
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+import torchaudio.functional as AF
+import torchaudio.transforms as T
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 from config import Config
+from tqdm import tqdm
 
 config = Config()
 
@@ -58,6 +52,54 @@ def _pad_or_truncate(signal: np.ndarray) -> np.ndarray:
     return signal[:config.padding]
 
 
+def _extract_from_raw(raw: np.ndarray, feature_type: str):
+    """Feature extraction shared by `load_patients`'s clean and augmented-raw paths."""
+    if feature_type == "wav2vec2":
+        raw = _pad_or_truncate(raw)
+        return _get_wav2vec2_extractor()(raw, sampling_rate=config.sampling_rate,
+                                          return_tensors="pt").input_values
+    elif feature_type == "raw":
+        raw = _pad_or_truncate(raw)
+        return torch.from_numpy(raw.astype(np.float32))
+    elif feature_type == "opensmile":
+        return _get_opensmile_extractor().process_signal(raw, config.sampling_rate).values.flatten()
+    else:
+        raise ValueError(f"Unknown feature_type: {feature_type!r}")
+
+
+def band_stop_augment(signal: torch.Tensor, sr: int) -> torch.Tensor:
+    central_freq = np.random.uniform(200, 4000)
+    bandwidth_fraction = np.random.uniform(0.05, 2.0)
+    signal = signal.to(config.device)
+    return AF.bandreject_biquad(signal, sr, central_freq, Q=1.0 / bandwidth_fraction)
+
+
+def gaussian_noise_augment(signal: torch.Tensor, sr: int = None) -> torch.Tensor:
+    signal = signal.to(config.device)
+    noise_scale = torch.empty_like(signal).uniform_(0.001, 0.03)
+    return signal + signal * noise_scale
+
+
+def pitch_shift_augment(signal: torch.Tensor, sr: int) -> torch.Tensor:
+    n_steps = int(np.random.randint(-6, 7))
+    signal = signal.to(config.device)
+    shifter = T.PitchShift(sample_rate=sr, n_steps=n_steps).to(config.device)
+    with torch.no_grad():
+        return shifter(signal)
+
+AUGMENTATIONS = {
+    "band_stop": band_stop_augment,
+    "gaussian_noise": gaussian_noise_augment,
+    "pitch_shift": pitch_shift_augment,
+}
+
+
+def apply_augmentations(signal: torch.Tensor, sr: int, methods=tuple(AUGMENTATIONS)) -> torch.Tensor:
+    for method in methods:
+        signal = AUGMENTATIONS[method](signal, sr)
+    return signal
+
+
 def _extract_praat_features(wav_path) -> np.ndarray:
     """
     Ten Praat-derived perturbation features (Rehman et al., 2024, Table 3):
@@ -90,7 +132,7 @@ def _extract_praat_features(wav_path) -> np.ndarray:
     return np.nan_to_num(np.array(features, dtype=float), nan=0.0)
 
 
-def load_patients(feature_type: str = "wav2vec2", include_demographics: bool = False) -> dict:
+def load_patients(feature_type: str = "wav2vec2", include_demographics: bool = False, augment: bool = False) -> dict:
     """
     Load every .wav under `config.dataset_path/{benign,malignant,normal}`
     and extract the requested audio feature representation (see module
@@ -100,34 +142,34 @@ def load_patients(feature_type: str = "wav2vec2", include_demographics: bool = F
         feature_type: "wav2vec2", "raw", "opensmile", or "praat".
         include_demographics: also attach each patient's demographic/symptom
             row (read from `medicalhistory.xlsx`) under the "background" key.
+        augment: also run the raw waveform through all three Section 4
+            augmentations (combined) and extract the same feature
+            representation from it, stored under "augmented_signal" -
+            computed once here at load time rather than repeatedly at train
+            time. Not supported for feature_type="praat" (stays None).
 
     Returns:
-        dict mapping patient ID -> {"signal", "label", "background"}.
+        dict mapping patient ID -> {"signal", "augmented_signal", "label", "background"}.
     """
     patients = {}
     for voice_type in VOICE_TYPES:
         folder = config.dataset_path / voice_type
-        for wav_path in folder.glob("*.wav"):
+        for wav_path in tqdm(list(folder.glob("*.wav")), desc=f"Loading {voice_type}"):
             user_id = wav_path.stem
 
+            augmented_signal = None
             if feature_type == "praat":
                 signal = _extract_praat_features(wav_path)
             else:
                 raw, _ = librosa.load(wav_path, sr=config.sampling_rate)
-                if feature_type == "wav2vec2":
-                    raw = _pad_or_truncate(raw)
-                    signal = _get_wav2vec2_extractor()(raw, sampling_rate=config.sampling_rate,
-                                                         return_tensors="pt").input_values
-                elif feature_type == "raw":
-                    raw = _pad_or_truncate(raw)
-                    signal = torch.from_numpy(raw.astype(np.float32))
-                elif feature_type == "opensmile":
-                    signal = _get_opensmile_extractor().process_signal(raw, config.sampling_rate).values.flatten()
-                else:
-                    raise ValueError(f"Unknown feature_type: {feature_type!r}")
+                signal = _extract_from_raw(raw, feature_type)
+                if augment:
+                    aug_raw = apply_augmentations(torch.from_numpy(raw.astype(np.float32)), config.sampling_rate)
+                    augmented_signal = _extract_from_raw(aug_raw.detach().cpu().numpy(), feature_type)
 
             patients[user_id] = {
                 "signal": signal,
+                "augmented_signal": augmented_signal,
                 "label": 1 if voice_type == "malignant" else 0,
                 "background": None,
             }
@@ -174,12 +216,6 @@ def stratified_kfold(patients: dict, n_splits: int = 5):
     `load_patients` dataset (class-balance preserved in every fold, unlike
     `cross_validation`'s single unstratified split - useful given how few
     malignant examples there are).
-
-    Each fold's demographic/symptom columns are z-score normalized
-    independently, fit on that fold's train split only. Fold-local shallow
-    copies of each patient dict are used so a patient appearing in multiple
-    folds' train splits (unavoidable with k-fold) never gets normalized
-    on top of a previous fold's already-normalized values.
     """
     patient_list = list(patients.values())
     labels = [p["label"] for p in patient_list]
@@ -188,7 +224,9 @@ def stratified_kfold(patients: dict, n_splits: int = 5):
     for train_idx, test_idx in skf.split(patient_list, labels):
         train_data = [dict(patient_list[i]) for i in train_idx]
         test_data = [dict(patient_list[i]) for i in test_idx]
-
+        np.random.shuffle(train_data)
+        
+        # normalize non-binary colums in tabular data
         if train_data[0]["background"] is not None:
             bg_cols = train_data[0]["background"].index
             quant_cols = [col for col in bg_cols
@@ -230,14 +268,7 @@ def collate_fn(batch):
 
 
 def batch_inputs(data: list, shuffle: bool = False) -> DataLoader:
-    """
-    Wrap a patient list (from `cross_validation`) in a DataLoader.
-
-    Args:
-        shuffle: whether to shuffle the data (ignored if `stratify=True`).
-        stratify: use `StratifiedBatchSampler` so every batch carries a
-            fixed malignant/benign-normal ratio; typically only for train.
-    """
+    """Wrap a patient list (from `cross_validation`/`stratified_kfold`) in a DataLoader."""
     labels = torch.tensor([patient["label"] for patient in data])
     dataset = ThroatCancerDataset(data, labels)
     return DataLoader(dataset, batch_size=config.batch_size, shuffle=shuffle, collate_fn=collate_fn)
