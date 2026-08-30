@@ -1,9 +1,5 @@
 """
 Shared data-loading pipeline for every training script in this project.
-Centralizes: walking the raw `.wav` dataset + `medicalhistory.xlsx` files,
-the four supported audio feature representations, the train/test split +
-demographic normalization, and the PyTorch Dataset/DataLoader/batch-sampler
-plumbing used by the neural-net baselines. 
 """
 
 import librosa
@@ -137,19 +133,6 @@ def load_patients(feature_type: str = "wav2vec2", include_demographics: bool = F
     Load every .wav under `config.dataset_path/{benign,malignant,normal}`
     and extract the requested audio feature representation (see module
     docstring for the four supported `feature_type`s).
-
-    Args:
-        feature_type: "wav2vec2", "raw", "opensmile", or "praat".
-        include_demographics: also attach each patient's demographic/symptom
-            row (read from `medicalhistory.xlsx`) under the "background" key.
-        augment: also run the raw waveform through all three Section 4
-            augmentations (combined) and extract the same feature
-            representation from it, stored under "augmented_signal" -
-            computed once here at load time rather than repeatedly at train
-            time. Not supported for feature_type="praat" (stays None).
-
-    Returns:
-        dict mapping patient ID -> {"signal", "augmented_signal", "label", "background"}.
     """
     patients = {}
     for voice_type in VOICE_TYPES:

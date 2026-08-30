@@ -12,13 +12,16 @@ class AudioEncoder(nn.Module):
     is fully frozen (even LoRA still overfit); the CNN feature extractor and
     its projection into the transformer stay trainable.
     """
-    def __init__(self, w2v_name, latent_dim=256):
+    def __init__(self, w2v_name, freeze=False, latent_dim=256):
         super().__init__()
         self.encoder = Wav2Vec2Model.from_pretrained(w2v_name)
         self.output_dim = latent_dim
         self.proj = nn.Linear(self.encoder.config.hidden_size, latent_dim)
         for param in self.encoder.encoder.parameters():
             param.requires_grad = False
+        if freeze: 
+            for param in self.encoder.feature_extractor.parameters():
+                param.requires_grad = False
 
     def forward(self, audio):
         return self.proj(self.encoder(audio).last_hidden_state.mean(dim=1))
@@ -26,14 +29,14 @@ class AudioEncoder(nn.Module):
 
 class Wav2VecBase(nn.Module):
     """Audio-only classifier: pooled wav2vec2 features -> linear head."""
-    def __init__(self, config):
+    def __init__(self, config, freeze=False):
         super().__init__()
-        self.aud_encoder = AudioEncoder(config.w2v_name)
+        self.aud_encoder = AudioEncoder(config.w2v_name, freeze)
         self.classifier = nn.Linear(self.aud_encoder.output_dim, 2)
 
     def forward(self, signals: torch.Tensor, demographics: torch.Tensor = None) -> torch.Tensor:
         z_A = self.aud_encoder(signals)
-        return self.classifier(F.dropout(z_A, p=0.1, training=self.training))
+        return self.classifier(F.dropout(z_A, p=0.3, training=self.training))
 
 
 class FusionModule(nn.Module):
@@ -44,7 +47,7 @@ class FusionModule(nn.Module):
     training).
     """
     def __init__(self, config, num_features: int, demo_dim: int = 64,
-                 gate: bool = False, p_drop: float = 0.0):
+                 gate: bool = True, p_drop: float = 0.1):
         super().__init__()
         self.p_drop = p_drop
         self.aud_encoder = AudioEncoder(config.w2v_name)
@@ -52,16 +55,12 @@ class FusionModule(nn.Module):
         self.demographic_enc = nn.Sequential(
             nn.Linear(num_features, demo_dim),
             nn.ReLU(),
-            nn.Dropout(p=0.1),
+            nn.BatchNorm1d(demo_dim),
+            nn.Dropout(p=0.3),
             nn.Linear(demo_dim, demo_dim),
         )
         self.classifier = nn.Linear(combined_dim, 2)
-        self.gate = nn.Sequential(
-            nn.Linear(combined_dim, combined_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(combined_dim, combined_dim),
-        ) if gate else None
+        self.gate = nn.Linear(combined_dim, combined_dim) if gate else None
 
     def forward(self, audio: torch.Tensor, demographic: torch.Tensor) -> torch.Tensor:
         z_A = self.aud_encoder(audio)
@@ -77,7 +76,7 @@ class FusionModule(nn.Module):
         if self.gate:
             concat = concat * torch.sigmoid(self.gate(concat))
 
-        return self.classifier(F.dropout(concat, p=0.1, training=self.training))
+        return self.classifier(F.dropout(concat, p=0.3, training=self.training))
 
 
 class ConvBlock1D(nn.Module):

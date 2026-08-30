@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 from argparse import ArgumentParser
 from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.preprocessing import StandardScaler
 
 from config import Config
@@ -96,30 +96,29 @@ def main():
             "gamma": ["scale", "auto", 0.4, 0.8, 1.6, 3.2],
             "kernel": ["rbf", "poly"],
         }
-        grid = GridSearchCV(SVC(class_weight="balanced"), param_grid, scoring="roc_auc", cv=5, n_jobs=-1)
+        grid = GridSearchCV(SVC(class_weight="balanced"), param_grid, scoring="balanced_accuracy", cv=5, n_jobs=-1)
         grid.fit(X_train, y_train)
 
         print(f"Best params: {grid.best_params_}")
         model = grid.best_estimator_
 
         preds = model.predict(X_test)
-        scores = model.decision_function(X_test)
 
         tn, fp, fn, tp = confusion_matrix(y_test, preds, labels=[0, 1]).ravel()
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-        auroc = roc_auc_score(y_test, scores)
+        balanced_acc = (sensitivity + specificity) / 2
 
-        print(f"Fold {fold} test sensitivity: {sensitivity:.3f} specificity: {specificity:.3f} auroc: {auroc:.3f}")
+        print(f"Fold {fold} test sensitivity: {sensitivity:.3f} specificity: {specificity:.3f} bal_acc: {balanced_acc:.3f}")
 
         visualize(y_test, preds, f"{args.results_name}_fold{fold}")
-        fold_metrics.append((sensitivity, specificity, auroc))
+        fold_metrics.append((sensitivity, specificity, balanced_acc))
 
-    senss, specs, aurocs = zip(*fold_metrics)
+    senss, specs, bal_accs = zip(*fold_metrics)
     print("\n=== K-Fold Summary ===")
-    print(f"Sensitivity: {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
-    print(f"Specificity: {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
-    print(f"AUROC:       {np.mean(aurocs):.3f} +/- {np.std(aurocs):.3f}")
+    print(f"Sensitivity:       {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
+    print(f"Specificity:       {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
+    print(f"Balanced Accuracy: {np.mean(bal_accs):.3f} +/- {np.std(bal_accs):.3f}")
 
 
 if __name__ == '__main__':

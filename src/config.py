@@ -15,9 +15,9 @@ class Config:
     pretrained: bool = True
 
     # model training
-    num_epochs: int = 20
+    num_epochs: int = 50
     warmup_steps: int = 2
-    patience: int = 5
+    patience: int = 10
     batch_size: int = 64
     lr: float = 1e-4
     max_grad_norm: float = 1.0

@@ -1,18 +1,5 @@
 """
 1D-CNN baseline for throat cancer classification, adapted from Kim et al., https://doi.org/10.3390/jcm9113415.
-
-Operates directly on the raw waveform (no hand-crafted features). Six
-convolution blocks with channel counts 16/32/64/128/256/256 (matching the
-paper), each followed by BatchNorm + ReLU; the last five blocks are also
-max-pooled (paper: pool sizes 8, 8, 8, 8, 4). The paper tuned its fixed
-110,000-sample input and final pooled length of 6 to its own 22050 Hz
-recordings; ours are 3s at 16kHz (`config.padding` samples), so the final
-block uses an AdaptiveMaxPool1d(6) instead of a fixed-size pool to still
-land on the paper's 6 x 256 = 1536 flattened features feeding the paper's
-dense head (1536 -> 100 -> 50 -> 2). Audio-only, matching the paper.
-
-Run from `src/`:
-    python cnn1d.py --name cnn1d_v1
 """
 
 import numpy as np
@@ -23,7 +10,7 @@ import matplotlib.pyplot as plt
 
 from argparse import ArgumentParser
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, average_precision_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 from config import Config
 from dataset import load_patients, stratified_kfold, batch_inputs
@@ -34,25 +21,6 @@ warnings.filterwarnings("ignore")
 
 config = Config()
 torch.manual_seed(1337)
-
-
-class FocalLoss(nn.Module):
-    """
-    Focal loss (Lin et al., 2017) for the class-imbalanced benign/normal vs.
-    malignant split: down-weights easy, well-classified examples (via
-    `(1-pt)**gamma`) and reweights classes by `alpha`/`1-alpha`.
-    """
-    def __init__(self, gamma=2.0, alpha=0.969):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-
-    def forward(self, logits, labels):
-        ce = F.cross_entropy(logits, labels, reduction="none")
-        pt = torch.exp(-ce)
-        alpha_t = torch.where(labels == 1, self.alpha, 1 - self.alpha)
-        return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
-
 
 def train_epoch(loader, model, optimizer, loss_fn):
     """Run one training pass over `loader`, returning (avg_loss, accuracy)."""
@@ -79,11 +47,11 @@ def eval_epoch(loader, model, loss_fn):
     Run one no-grad evaluation pass over `loader`.
 
     Returns:
-        (avg_loss, accuracy, sensitivity, specificity, auprc, preds, labels)
+        (avg_loss, accuracy, sensitivity, specificity, balanced_accuracy, preds, labels)
     """
     model.eval()
     total_loss, correct, total = 0, 0, 0
-    all_preds, all_labels, all_probs = [], [], []
+    all_preds, all_labels = [], []
     with torch.no_grad():
         for signals, demographics, labels in tqdm(loader, desc="Eval", leave=False):
             signals = signals.to(config.device)
@@ -93,19 +61,17 @@ def eval_epoch(loader, model, loss_fn):
             loss = loss_fn(logits, labels)
 
             total_loss += loss.item()
-            probs = F.softmax(logits, dim=-1)[:, 1]
             preds = logits.argmax(dim=-1)
             correct += (preds == labels).sum().item()
             total += len(labels)
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
-            all_probs.extend(probs.cpu().tolist())
 
     tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    auprc = average_precision_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
-    return total_loss / len(loader), correct / total, sensitivity, specificity, auprc, all_preds, all_labels
+    balanced_acc = (sensitivity + specificity) / 2
+    return total_loss / len(loader), correct / total, sensitivity, specificity, balanced_acc, all_preds, all_labels
 
 
 def visualize(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, file_name="cnn1d_results"):
@@ -159,11 +125,11 @@ def main():
     fold_metrics = []
     for fold, (train_data, test_data) in enumerate(stratified_kfold(patients, n_splits=args.n_splits), start=1):
         print(f"\n=== Fold {fold}/{args.n_splits} ===")
-        train_loader = batch_inputs(train_data, stratify=True)
+        train_loader = batch_inputs(train_data)
         test_loader = batch_inputs(test_data)
 
         model = CNN1D().to(config.device)
-        loss_fn = FocalLoss().to(config.device)
+        loss = nn.CrossEntropyLoss(weight=torch.tensor([1., 32.]))
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
         train_losses, val_losses = [], []
@@ -173,12 +139,12 @@ def main():
             print(f"Model layout: {model}")
             print("Trainable parameters:", sum(p.numel() for p in model.parameters()))
 
-        best_loss = float('inf')
+        best_ba = 0
         best_metrics = None
         no_improv = 0
         for epoch in range(1, config.num_epochs + 1):
             tr_loss, tr_acc = train_epoch(train_loader, model, optimizer, loss_fn)
-            val_loss, val_acc, val_sens, val_spec, val_auprc, preds, labels = eval_epoch(test_loader, model, loss_fn)
+            val_loss, val_acc, val_sens, val_spec, val_bal_acc, preds, labels = eval_epoch(test_loader, model, loss_fn)
 
             train_losses.append(tr_loss)
             val_losses.append(val_loss)
@@ -187,13 +153,13 @@ def main():
 
             print(f"Epoch {epoch:02d} | "
                 f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
-                f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} auprc: {val_auprc:.3f}")
+                f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} sensitivity: {val_sens:.3f} specificity: {val_spec:.3f} bal_acc: {val_bal_acc:.3f}")
 
-            if val_loss < best_loss:
+            if val_bal_acc > best_ba: 
                 print("Updating best model...")
-                best_loss = val_loss
+                best_ba = val_bal_acc
                 no_improv = 0
-                best_metrics = (val_acc, val_sens, val_spec, val_auprc)
+                best_metrics = (val_acc, val_sens, val_spec, val_bal_acc)
                 torch.save(model.state_dict(), f"../checkpoints/{args.name}_fold{fold}_best.pt")
                 visualize(train_losses, val_losses, train_accs, val_accs, preds, labels, f"{args.results_name}_fold{fold}")
             else:
@@ -204,12 +170,12 @@ def main():
 
         fold_metrics.append(best_metrics)
 
-    accs, senss, specs, auprcs = zip(*fold_metrics)
+    accs, senss, specs, bal_accs = zip(*fold_metrics)
     print("\n=== K-Fold Summary ===")
-    print(f"Accuracy:    {np.mean(accs):.3f} +/- {np.std(accs):.3f}")
-    print(f"Sensitivity: {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
-    print(f"Specificity: {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
-    print(f"AUPRC:       {np.mean(auprcs):.3f} +/- {np.std(auprcs):.3f}")
+    print(f"Accuracy:          {np.mean(accs):.3f} +/- {np.std(accs):.3f}")
+    print(f"Sensitivity:       {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
+    print(f"Specificity:       {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
+    print(f"Balanced Accuracy: {np.mean(bal_accs):.3f} +/- {np.std(bal_accs):.3f}")
 
 
 if __name__ == '__main__':

@@ -37,9 +37,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import (
-    confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
-)
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.preprocessing import StandardScaler
 
 from config import Config
@@ -123,7 +121,6 @@ def main():
         model = grid.best_estimator_
 
         preds = model.predict(X_test)
-        probs = model.predict_proba(X_test)[:, 1]
 
         tn, fp, fn, tp = confusion_matrix(y_test, preds, labels=[0, 1]).ravel()
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -136,11 +133,11 @@ def main():
         visualize(y_test, preds, f"{args.results_name}_fold{fold}")
         fold_metrics.append((sensitivity, specificity, balanced_acc))
 
-    senss, specs, aurocs = zip(*fold_metrics)
+    senss, specs, bal_accs = zip(*fold_metrics)
     print("\n=== K-Fold Summary ===")
-    print(f"Sensitivity: {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
-    print(f"Specificity: {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
-    print(f"AUROC:       {np.mean(aurocs):.3f} +/- {np.std(aurocs):.3f}")
+    print(f"Sensitivity:       {np.mean(senss):.3f} +/- {np.std(senss):.3f}")
+    print(f"Specificity:       {np.mean(specs):.3f} +/- {np.std(specs):.3f}")
+    print(f"Balanced Accuracy: {np.mean(bal_accs):.3f} +/- {np.std(bal_accs):.3f}")
 
 if __name__ == '__main__':
     main()
